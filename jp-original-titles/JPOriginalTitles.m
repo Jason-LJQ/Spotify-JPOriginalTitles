@@ -878,47 +878,6 @@ NSData *JPTRewriteSearch(NSData *body, NSDictionary<NSString *, JPTTrackInfo *> 
 #pragma mark - Logging
 
 static void JPTLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
-#ifndef JPT_LOGGING
-#define JPT_LOGGING 0
-#endif
-
-static void JPTLog(NSString *format, ...) {
-#if !JPT_LOGGING
-    // Logging is off by default (build with -DJPT_LOGGING=1); remove the file left by earlier versions
-    static dispatch_once_t cleanup;
-    dispatch_once(&cleanup, ^{
-        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        [[NSFileManager defaultManager] removeItemAtPath:[docs stringByAppendingPathComponent:@"JPOriginalTitles.log"] error:nil];
-    });
-#else
-    va_list args;
-    va_start(args, format);
-    NSString *line = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    NSLog(@"[JPOriginalTitles] %@", line);
-    static dispatch_queue_t queue;
-    static NSString *path;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        queue = dispatch_queue_create("jpt.log", DISPATCH_QUEUE_SERIAL);
-        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        path = [docs stringByAppendingPathComponent:@"JPOriginalTitles.log"];
-        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
-    });
-    NSString *stamped = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], line];
-    dispatch_async(queue, ^{
-        NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!h) {
-            [stamped writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
-            return;
-        }
-        [h seekToEndOfFile];
-        [h writeData:[stamped dataUsingEncoding:NSUTF8StringEncoding]];
-        [h closeFile];
-    });
-#endif
-}
-
 #pragma mark - Original-name metadata cache
 
 // Artist names are localized by Accept-Language; zh returns the original names (ja katakanizes Chinese artists)
@@ -957,7 +916,7 @@ static void JPTFetchOriginals(NSURLRequest *template, NSData *templateBody, NSSe
             }
         }
         JPTLog(@"original fetch %lu uris: status %ld, got %lu%@", (unsigned long)uris.count, (long)code,
-               (unsigned long)tracks.count, error ? [@", " stringByAppendingString:error.localizedDescription] : @"");
+               (unsigned long)tracks.count, error ? [NSString stringWithFormat:@", error %@/%ld", error.domain, (long)error.code] : @"");
         done();
     }] resume];
 }
@@ -1288,7 +1247,7 @@ static void JPTHookDelegate(NSString *name) {
     }));
 }
 
-__attribute__((constructor)) static void JPTInit(void) {
+static void JPTInitializeNetwork(void) {
     @autoreleasepool {
         gOriginalCache = [NSMutableDictionary dictionary];
         NSDictionary *saved = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTArtistNamesKey];
@@ -1308,32 +1267,6 @@ __attribute__((constructor)) static void JPTInit(void) {
     }
 }
 
-#pragma mark - Metadata cache purge
-
-// Bump when rewrite rules change so stale cached metadata is fetched again after an upgrade
-static NSString *const kJPTCacheVersion = @"6";
-static NSString *const kJPTCacheVersionKey = @"JPOriginalTitlesCacheVersion";
-
-// Runs at load time, before Spotify opens its core database; settings and login live elsewhere
-__attribute__((constructor)) static void JPTPurgeMetadataCache(void) {
-    @autoreleasepool {
-        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        if ([[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion]) return;
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
-        NSString *users = [support stringByAppendingPathComponent:@"PersistentCache/Users"];
-        BOOL ok = YES;
-        for (NSString *user in [fm contentsOfDirectoryAtPath:users error:nil]) {
-            // primary.ldb holds the extended-metadata cache (!xmeta#cache#) and library sync state
-            NSString *db = [[users stringByAppendingPathComponent:user] stringByAppendingPathComponent:@"primary.ldb"];
-            if (![fm fileExistsAtPath:db]) continue;
-            NSError *error = nil;
-            BOOL removed = [fm removeItemAtPath:db error:&error];
-            ok = ok && removed;
-            JPTLog(@"purge %@/primary.ldb: %@", user, removed ? @"removed" : error.localizedDescription);
-        }
-        if (ok) [defaults setObject:kJPTCacheVersion forKey:kJPTCacheVersionKey];
-    }
-}
+#include "JPTManagement.m"
 
 #endif
