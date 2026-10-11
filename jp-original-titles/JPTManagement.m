@@ -8,12 +8,12 @@
 #import <unistd.h>
 #import <limits.h>
 
-static NSString *const kJPTCacheVersion = @"6";
+static NSString *const kJPTCacheVersion = @"6.1";
 static NSString *const kJPTCacheVersionKey = @"JPOriginalTitlesCacheVersion";
 static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
 static NSString *const kJPTPendingResetKey = @"JPOriginalTitlesPendingReset";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
-static NSString *const kJPTBuild = @"v6 · management 2026-10-11";
+static NSString *const kJPTBuild = @"v6.1";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
 static BOOL gJPTManagementHookInstalled;
@@ -85,14 +85,14 @@ static void JPTLog(NSString *format, ...) {
 }
 
 static NSString *JPTScopeName(NSString *scope) {
-    return [scope isEqualToString:@"metadata"] ? @"名称与曲库索引缓存" : @"插件名称缓存";
+    return [scope isEqualToString:@"metadata"] ? @"Spotify metadata and library index" : @"Plugin name cache";
 }
 
 static NSString *JPTResetSummary(void) {
     NSDictionary *last = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTLastResetKey];
-    if (!last) return @"尚无重置记录";
-    NSString *state = [last[@"success"] boolValue] ? @"成功" : @"失败，可重试";
-    return [NSString stringWithFormat:@"%@ · %@ · %@（删除 %@ 个数据库）", last[@"date"],
+    if (!last) return @"No reset recorded";
+    NSString *state = [last[@"success"] boolValue] ? @"Succeeded" : @"Failed; retry available";
+    return [NSString stringWithFormat:@"%@ · %@ · %@ (%@ databases removed)", last[@"date"],
             JPTScopeName(last[@"scope"]), state, last[@"removed"] ?: @0];
 }
 
@@ -119,6 +119,8 @@ static NSString *JPTDiagnosticSummary(void) {
     [lines addObject:[NSString stringWithFormat:@"Pending reset: %@", pending ? JPTScopeName(pending[@"scope"]) : @"none"]];
     [lines addObject:JPTResetSummary()];
     NSDictionary *last = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTLastResetKey];
+    if (last[@"targets"]) [lines addObject:[NSString stringWithFormat:@"Startup database targets: %@; user directory exists: %@; database open: %@", last[@"targets"], last[@"usersExist"], last[@"databaseOpen"]]];
+    [lines addObject:[NSString stringWithFormat:@"Cache version: %@", [[NSUserDefaults standardUserDefaults] stringForKey:kJPTCacheVersionKey] ?: @"unset"]];
     if (last[@"errors"]) [lines addObject:[NSString stringWithFormat:@"Reset errors: %@", last[@"errors"]]];
     return [lines componentsJoinedByString:@"\n"];
 }
@@ -200,6 +202,8 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
     BOOL ok = errors.count == 0;
     NSMutableDictionary *result = [@{@"scope": scope ?: @"plugin", @"date": [NSDate date].description,
         @"success": @(ok), @"removed": @(removed), @"databaseOpen": @(open), @"errors": errors} mutableCopy];
+    result[@"targets"] = @(targets.count);
+    result[@"usersExist"] = @([[NSFileManager defaultManager] fileExistsAtPath:users]);
     if (pending[@"migration"]) result[@"migration"] = pending[@"migration"];
     [defaults setObject:result forKey:kJPTLastResetKey];
     if (ok) {
@@ -215,109 +219,117 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
     JPTLog(@"startup reset %@: removed %lu, open %d, errors %lu", scope, (unsigned long)removed, open, (unsigned long)errors.count);
 }
 
+// Persist before quitting; retries retain only the targets that previously failed.
+static BOOL JPTSavePendingReset(NSUserDefaults *defaults, NSString *scope, BOOL retry) {
+    NSMutableDictionary *pending = retry ? [[defaults dictionaryForKey:kJPTPendingResetKey] mutableCopy] : [NSMutableDictionary dictionary];
+    if (!pending) return NO;
+    pending[@"scope"] = scope;
+    [pending removeObjectForKey:@"failed"];
+    [defaults setObject:pending forKey:kJPTPendingResetKey];
+    return [defaults synchronize];
+}
+
 #ifndef JPT_MANAGEMENT_TEST
 @interface JPTManagementController : UITableViewController
+@property (nonatomic) BOOL resetPlugin;
+@property (nonatomic) BOOL resetMetadata;
+@property (nonatomic) BOOL retryFailed;
 @end
 
 @implementation JPTManagementController
-- (instancetype)init {
-    return [super initWithStyle:UITableViewStyleInsetGrouped];
-}
+- (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"原文名称";
+    self.title = @"Original Titles";
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"刷新" style:UIBarButtonItemStylePlain
-        target:self action:@selector(refresh)];
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
-        target:self action:@selector(close)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Apply" style:UIBarButtonItemStyleDone target:self action:@selector(apply)];
+    self.navigationItem.rightBarButtonItem.accessibilityIdentifier = @"jpt.apply";
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Done" style:UIBarButtonItemStylePlain target:self action:@selector(close)];
 }
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self refresh];
-}
+- (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self refresh]; }
 - (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
-- (void)refresh { [self.tableView reloadData]; }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return section == 0 ? 4 : section == 1 ? 3 : 4; }
-- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    return @[@"状态", @"诊断", @"缓存维护"][section];
+- (void)refresh {
+    self.navigationItem.rightBarButtonItem.enabled = self.resetPlugin || self.resetMetadata || self.retryFailed;
+    [self.tableView reloadData];
 }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return section == 0 ? 4 : section == 1 ? 3 : 5; }
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section { return @[@"Status", @"Diagnostics", @"Reset Options"][section]; }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == 1) return @"诊断默认关闭。日志可能包含曲目名称与 URI，不记录认证令牌或完整响应。日志最多保留两份，每份 1 MB。";
-    if (section == 2) return @"重置在完全关闭后重新启动 Spotify 时执行。仅重置插件缓存不会刷新 Spotify 已存的名称；名称与曲库索引重置需要联网重新同步。";
+    if (section == 1) return @"Logging is off by default. Logs may include track names and URIs. No authentication tokens or full responses are recorded. Two log files are retained, up to 1 MB each.";
+    if (section == 2) return @"Select reset options, then tap Apply. Apply saves the request and closes the app immediately. Reopen Spotify to complete the reset. Metadata reset requires online resync and may discard unsynced offline changes. Login, settings and audio files are kept; downloaded offline playback after reset is unverified.";
     return nil;
+}
+- (void)checkbox:(UITableViewCell *)cell selected:(BOOL)selected identifier:(NSString *)identifier {
+    UIImageView *box = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:selected ? @"checkmark.square.fill" : @"square"]];
+    box.tintColor = selected ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+    box.frame = CGRectMake(0, 0, 24, 24);
+    cell.accessoryView = box;
+    cell.accessibilityIdentifier = identifier;
+    cell.accessibilityValue = selected ? @"Selected" : @"Not selected";
+    if (selected) cell.accessibilityTraits |= UIAccessibilityTraitSelected;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 }
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)index {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-    cell.textLabel.numberOfLines = 0;
-    cell.detailTextLabel.numberOfLines = 0;
+    cell.textLabel.numberOfLines = 0; cell.detailTextLabel.numberOfLines = 0;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSDictionary *pending = [defaults dictionaryForKey:kJPTPendingResetKey];
+    NSDictionary *pending = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTPendingResetKey];
     if (index.section == 0) {
-        cell.textLabel.text = @[@"版本", @"网络 hook", @"插件缓存", @"上次重置"][index.row];
-        if (index.row == 0) cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · Spotify %@", kJPTBuild,
-            [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?"];
-        if (index.row == 1) cell.detailTextLabel.text = [NSString stringWithFormat:@"Core %@ · HttpClient %@",
-            JPTDelegateHooked(@"SPTCoreURLSessionDataDelegate") ? @"已安装" : @"不可用",
-            JPTDelegateHooked(@"Connectivity_HttpClientKit.HttpClientURLSession") ? @"已安装" : @"不可用"];
-        if (index.row == 2) cell.detailTextLabel.text = [NSString stringWithFormat:@"原文曲目 %lu · 艺人映射 %lu",
-            (unsigned long)JPTOriginalSnapshot().count, (unsigned long)JPTArtistNamesSnapshot().count];
+        cell.textLabel.text = @[@"Version", @"Network Hooks", @"Plugin Cache", @"Last Reset"][index.row];
+        if (index.row == 0) cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · Spotify %@", kJPTBuild, [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?"];
+        if (index.row == 1) cell.detailTextLabel.text = [NSString stringWithFormat:@"Core %@ · HttpClient %@", JPTDelegateHooked(@"SPTCoreURLSessionDataDelegate") ? @"installed" : @"unavailable", JPTDelegateHooked(@"Connectivity_HttpClientKit.HttpClientURLSession") ? @"installed" : @"unavailable"];
+        if (index.row == 2) cell.detailTextLabel.text = [NSString stringWithFormat:@"Original tracks %lu · Artist names %lu", (unsigned long)JPTOriginalSnapshot().count, (unsigned long)JPTArtistNamesSnapshot().count];
         if (index.row == 3) cell.detailTextLabel.text = JPTResetSummary();
     } else if (index.section == 1) {
-        cell.textLabel.text = @[@"诊断日志", @"导出诊断", @"清空日志"][index.row];
+        cell.textLabel.text = @[@"Diagnostic Logging", @"Export Diagnostics", @"Clear Logs"][index.row];
         if (index.row == 0) {
             cell.accessibilityIdentifier = @"jpt.logging";
-            UISwitch *toggle = [UISwitch new];
-            toggle.on = atomic_load(&gJPTLogging);
-            toggle.accessibilityIdentifier = @"jpt.logging";
-            [toggle addTarget:self action:@selector(loggingChanged:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = toggle;
+            UISwitch *toggle = [UISwitch new]; toggle.on = atomic_load(&gJPTLogging); toggle.accessibilityIdentifier = @"jpt.logging";
+            [toggle addTarget:self action:@selector(loggingChanged:) forControlEvents:UIControlEventValueChanged]; cell.accessoryView = toggle;
         } else cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     } else {
-        cell.textLabel.text = @[@"重置插件名称缓存", @"重置名称与曲库索引缓存", @"待执行重置", @"取消待执行重置"][index.row];
-        if (index.row == 2) {
-            cell.detailTextLabel.text = pending ? [NSString stringWithFormat:@"%@ · %@", JPTScopeName(pending[@"scope"]),
-                [pending[@"failed"] boolValue] ? @"失败，点此预约重试" : @"下次启动执行"] : @"无";
-            if ([pending[@"failed"] boolValue]) cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        cell.textLabel.text = @[@"Reset Plugin Name Cache", @"Reset Spotify Metadata and Library Index", @"Retry Failed Reset", @"Pending Reset", @"Cancel Pending Reset"][index.row];
+        if (index.row == 0) {
+            cell.detailTextLabel.text = @"Clear original-track lookups and learned artist names.";
+            [self checkbox:cell selected:self.resetPlugin identifier:@"jpt.reset.plugin"];
+        } else if (index.row == 1) {
+            cell.detailTextLabel.text = @"Also reset the plugin cache. Spotify must resync online.";
+            [self checkbox:cell selected:self.resetMetadata identifier:@"jpt.reset.metadata"];
+        } else if (index.row == 2) {
+            if ([pending[@"failed"] boolValue]) {
+                cell.detailTextLabel.text = JPTScopeName(pending[@"scope"]);
+                [self checkbox:cell selected:self.retryFailed identifier:@"jpt.reset.retry"];
+            } else { cell.detailTextLabel.text = @"No failed reset"; cell.textLabel.textColor = [UIColor secondaryLabelColor]; }
+        } else if (index.row == 3) {
+            cell.detailTextLabel.text = pending ? [NSString stringWithFormat:@"%@ · %@", JPTScopeName(pending[@"scope"]), [pending[@"failed"] boolValue] ? @"Failed" : @"On next launch"] : @"None";
         } else {
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-            if (index.row == 3 && !pending) cell.textLabel.textColor = [UIColor secondaryLabelColor];
+            cell.selectionStyle = pending ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
+            if (!pending) cell.textLabel.textColor = [UIColor secondaryLabelColor];
         }
     }
     return cell;
 }
 - (void)message:(NSString *)title body:(NSString *)body {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:body preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 - (void)loggingChanged:(UISwitch *)toggle {
     [[NSUserDefaults standardUserDefaults] setBool:toggle.on forKey:kJPTLoggingKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    atomic_store(&gJPTLogging, toggle.on);
+    [[NSUserDefaults standardUserDefaults] synchronize]; atomic_store(&gJPTLogging, toggle.on);
     if (toggle.on) JPTLog(@"diagnostics enabled\n%@", JPTDiagnosticSummary());
 }
-- (void)schedule:(NSString *)scope retry:(BOOL)retry {
-    NSString *body = [scope isEqualToString:@"metadata"]
-        ? @"下次启动清除名称元数据与曲库索引，并重置插件缓存。登录、设置和音频文件保留；需要联网重新同步，蓝牙引导可能重现，离线未同步改动可能丢失。清理后已下载歌曲的离线播放尚未验证。"
-        : @"下次启动清除插件的原文曲目与艺人映射。Spotify 已存的名称不会被清除，映射会逐步重新学习。";
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:retry ? @"重试缓存重置" : @"预约缓存重置"
-        message:body preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"下次启动重置" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        NSMutableDictionary *pending = retry ? [[defaults dictionaryForKey:kJPTPendingResetKey] mutableCopy] : [NSMutableDictionary dictionary];
-        pending[@"scope"] = scope;
-        [pending removeObjectForKey:@"failed"];
-        [defaults setObject:pending forKey:kJPTPendingResetKey];
-        [defaults synchronize];
-        JPTLog(@"reset scheduled: %@", scope);
-        [self refresh];
-        [self message:@"已预约" body:@"请完全关闭后重新打开 Spotify。进入后台不会执行重置；重启前可以取消预约。"];
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
+- (void)apply {
+    if (!self.resetPlugin && !self.resetMetadata && !self.retryFailed) return;
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *scope = self.retryFailed ? [defaults dictionaryForKey:kJPTPendingResetKey][@"scope"] : self.resetMetadata ? @"metadata" : @"plugin";
+    if (!JPTSavePendingReset(defaults, scope, self.retryFailed)) {
+        [self message:@"Apply Failed" body:@"The reset request could not be saved. The app will stay open; please retry."]; return;
+    }
+    JPTLog(@"Apply: reset %@ saved; quitting", scope);
+    dispatch_sync(JPTLogQueue(), ^{});
+    exit(EXIT_SUCCESS);
 }
 - (void)exportFrom:(UITableViewCell *)cell {
     NSString *summary = JPTDiagnosticSummary();
@@ -336,13 +348,10 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
         NSURL *url = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"JPOriginalTitles-diagnostics.txt"]];
         BOOL ok = !error && [text writeToURL:url atomically:YES encoding:NSUTF8StringEncoding error:&error];
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!ok) { [[NSFileManager defaultManager] removeItemAtPath:dir error:nil]; [self message:@"导出失败" body:@"无法写入诊断文件，请重试。"]; return; }
+            if (!ok) { [[NSFileManager defaultManager] removeItemAtPath:dir error:nil]; [self message:@"Export Failed" body:@"Unable to write the diagnostic file. Please retry."]; return; }
             UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
-            share.popoverPresentationController.sourceView = cell;
-            share.popoverPresentationController.sourceRect = cell.bounds;
-            share.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *shareError) {
-                [[NSFileManager defaultManager] removeItemAtPath:dir error:nil];
-            };
+            share.popoverPresentationController.sourceView = cell; share.popoverPresentationController.sourceRect = cell.bounds;
+            share.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *shareError) { [[NSFileManager defaultManager] removeItemAtPath:dir error:nil]; };
             [self presentViewController:share animated:YES completion:nil];
         });
     });
@@ -356,75 +365,128 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
         dispatch_async(JPTLogQueue(), ^{
             [[NSFileManager defaultManager] removeItemAtPath:JPTLogPath() error:nil];
             [[NSFileManager defaultManager] removeItemAtPath:[JPTLogPath() stringByAppendingString:@".1"] error:nil];
-            dispatch_async(dispatch_get_main_queue(), ^{ [self message:@"日志已清空" body:@"诊断开关保持原状态，后续日志会继续按该状态记录。"]; });
+            dispatch_async(dispatch_get_main_queue(), ^{ [self message:@"Logs Cleared" body:@"The diagnostic logging setting is unchanged."]; });
         });
     }
-    if (index.section == 2 && index.row < 2) [self schedule:index.row == 1 ? @"metadata" : @"plugin" retry:NO];
-    if (index.section == 2 && index.row == 2 && [pending[@"failed"] boolValue]) [self schedule:pending[@"scope"] retry:YES];
-    if (index.section == 2 && index.row == 3 && pending) {
-        [defaults removeObjectForKey:kJPTPendingResetKey];
-        [defaults synchronize];
-        JPTLog(@"pending reset cancelled");
-        [self refresh];
-    }
+    if (index.section != 2) return;
+    if (index.row == 0) { self.retryFailed = NO; self.resetPlugin = !self.resetPlugin; if (!self.resetPlugin) self.resetMetadata = NO; }
+    if (index.row == 1) { self.retryFailed = NO; self.resetMetadata = !self.resetMetadata; if (self.resetMetadata) self.resetPlugin = YES; }
+    if (index.row == 2 && [pending[@"failed"] boolValue]) { self.retryFailed = !self.retryFailed; self.resetPlugin = NO; self.resetMetadata = NO; }
+    if (index.row == 4 && pending) { [defaults removeObjectForKey:kJPTPendingResetKey]; [defaults synchronize]; self.retryFailed = NO; JPTLog(@"pending reset cancelled"); }
+    [self refresh];
 }
 @end
 
 @interface JPTManagementEntry : NSObject
 @property (nonatomic, weak) UIViewController *host;
+@property (nonatomic, weak) UIBarButtonItem *gear;
+@property (nonatomic, weak) UIButton *eeveeRow;
+@property (nonatomic, weak) UIButton *titleRow;
 - (void)open;
+- (void)openEevee;
 @end
 @implementation JPTManagementEntry
+- (void)openEevee {
+    UIControl *control = [self.gear.customView isKindOfClass:[UIControl class]] ? (UIControl *)self.gear.customView : nil;
+    [control sendActionsForControlEvents:UIControlEventTouchUpInside];
+}
 - (void)open {
     if (!self.host || self.host.presentedViewController) return;
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[JPTManagementController new]];
     nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     UINavigationBarAppearance *appearance = [UINavigationBarAppearance new];
-    [appearance configureWithOpaqueBackground];
-    appearance.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    [appearance configureWithOpaqueBackground]; appearance.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     appearance.titleTextAttributes = @{NSForegroundColorAttributeName: [UIColor labelColor]};
-    nav.navigationBar.standardAppearance = appearance;
-    nav.navigationBar.scrollEdgeAppearance = appearance;
-    nav.navigationBar.compactAppearance = appearance;
+    nav.navigationBar.standardAppearance = appearance; nav.navigationBar.scrollEdgeAppearance = appearance; nav.navigationBar.compactAppearance = appearance;
     nav.navigationBar.tintColor = [UIColor labelColor];
     [self.host presentViewController:nav animated:YES completion:nil];
 }
 @end
 
 static char kJPTEntryKey;
+static UICollectionView *JPTSettingsCollection(UIView *view) {
+    if ([view isKindOfClass:[UICollectionView class]]) return (UICollectionView *)view;
+    for (UIView *child in view.subviews) { UICollectionView *found = JPTSettingsCollection(child); if (found) return found; }
+    return nil;
+}
+static UIButton *JPTSettingsRow(NSString *title, NSString *identifier, JPTManagementEntry *entry, SEL action) {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    button.contentEdgeInsets = UIEdgeInsetsMake(0, 16, 0, 42);
+    button.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
+    [button setTitle:title forState:UIControlStateNormal]; [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    button.accessibilityIdentifier = identifier; button.accessibilityLabel = title;
+    button.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [button addTarget:entry action:action forControlEvents:UIControlEventTouchUpInside];
+    UIImageView *arrow = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    arrow.tag = 0x4a5054;
+    arrow.tintColor = [UIColor secondaryLabelColor]; arrow.frame = CGRectMake(0, 26, 12, 16);
+    arrow.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin; [button addSubview:arrow];
+    return button;
+}
+static void JPTInsertManagementEntry(UIViewController *host) {
+    UICollectionView *collection = JPTSettingsCollection(host.view);
+    if (!collection || collection.bounds.size.width <= 0) return;
+    JPTManagementEntry *entry = objc_getAssociatedObject(collection, &kJPTEntryKey);
+    CGFloat height = 68;
+    if (!entry) {
+        UIBarButtonItem *gear = nil;
+        for (UIBarButtonItem *item in host.navigationItem.rightBarButtonItems) if (item.tag == 1337) { gear = item; break; }
+        UIView *existing = [collection viewWithTag:1338];
+        if (!existing && ![gear.customView isKindOfClass:[UIControl class]]) return;
+        entry = [JPTManagementEntry new]; entry.host = host; entry.gear = gear;
+        objc_setAssociatedObject(collection, &kJPTEntryKey, entry, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UIButton *eevee = (UIButton *)existing;
+        if (!eevee) { eevee = JPTSettingsRow(@"Eevee Settings", @"jpt.eevee", entry, @selector(openEevee)); [collection addSubview:eevee]; }
+        entry.eeveeRow = eevee;
+        UIButton *titles = JPTSettingsRow(@"Original Titles", @"jpt.management", entry, @selector(open));
+        [collection addSubview:titles]; entry.titleRow = titles;
+        // Reserve only our additional rows, once per collection-view instance.
+        CGFloat added = existing ? height : height * 2;
+        UIEdgeInsets inset = collection.contentInset; inset.top += added; collection.contentInset = inset;
+        UIEdgeInsets indicators = collection.verticalScrollIndicatorInsets; indicators.top += added; collection.verticalScrollIndicatorInsets = indicators;
+        CGPoint offset = collection.contentOffset; offset.y -= added; [collection setContentOffset:offset animated:NO];
+        JPTLog(@"inline settings entries installed; existing Eevee row %d, gear %d", existing != nil, gear != nil);
+    }
+    entry.host = host;
+    entry.eeveeRow.frame = CGRectMake(0, -height * 2, collection.bounds.size.width, height);
+    entry.titleRow.frame = CGRectMake(0, -height, collection.bounds.size.width, height);
+    UIView *eeveeArrow = [entry.eeveeRow viewWithTag:0x4a5054];
+    UIView *titleArrow = [entry.titleRow viewWithTag:0x4a5054];
+    eeveeArrow.frame = CGRectMake(collection.bounds.size.width - 28, 26, 12, 16);
+    titleArrow.frame = CGRectMake(collection.bounds.size.width - 28, 26, 12, 16);
+}
 static void JPTInstallManagementHook(void) {
     Class cls = NSClassFromString(@"_TtC21Settings_PlatformImpl26SettingsListViewController");
-    SEL selector = @selector(viewDidAppear:);
+    SEL selector = NSSelectorFromString(@"viewDidAppear:");
     Method method = cls ? JPTOwnMethod(cls, selector) : NULL;
-    if (!method) { JPTLog(@"settings hook unavailable"); return; }
-    typedef void (*Fn)(id, SEL, BOOL);
-    Fn original = (Fn)method_getImplementation(method);
-    method_setImplementation(method, imp_implementationWithBlock(^(UIViewController *host, BOOL animated) {
-        original(host, selector, animated);
-        JPTManagementEntry *entry = objc_getAssociatedObject(host, &kJPTEntryKey);
-        if (!entry) {
-            entry = [JPTManagementEntry new]; entry.host = host;
-            objc_setAssociatedObject(host, &kJPTEntryKey, entry, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        NSMutableArray *items = [host.navigationItem.rightBarButtonItems mutableCopy] ?: [NSMutableArray array];
-        for (UIBarButtonItem *item in items) if (item.target == entry) return;
-        UIBarButtonItem *button = [[UIBarButtonItem alloc] initWithTitle:@"原文" style:UIBarButtonItemStylePlain target:entry action:@selector(open)];
-        button.accessibilityLabel = @"原文名称管理";
-        button.accessibilityIdentifier = @"jpt.management";
-        [items addObject:button];
-        host.navigationItem.rightBarButtonItems = items;
-        JPTLog(@"settings entry added");
-    }));
-    gJPTManagementHookInstalled = YES;
-    JPTLog(@"settings hook installed");
+    if (method) {
+        IMP original = method_getImplementation(method);
+        method_setImplementation(method, imp_implementationWithBlock(^(UIViewController *host, BOOL animated) {
+            ((void (*)(id, SEL, BOOL))original)(host, selector, animated);
+            UICollectionView *collection = JPTSettingsCollection(host.view);
+            BOOL inserted = collection && !objc_getAssociatedObject(collection, &kJPTEntryKey);
+            JPTInsertManagementEntry(host);
+            if (inserted) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    JPTInsertManagementEntry(host);
+                    UICollectionView *current = JPTSettingsCollection(host.view);
+                    if (objc_getAssociatedObject(current, &kJPTEntryKey))
+                        [current setContentOffset:CGPointMake(current.contentOffset.x, -current.adjustedContentInset.top) animated:NO];
+                });
+            }
+        }));
+        gJPTManagementHookInstalled = YES;
+    }
+    JPTLog(@"settings hook %@", gJPTManagementHookInstalled ? @"installed" : @"unavailable");
 }
 
 __attribute__((constructor)) static void JPTInit(void) {
     @autoreleasepool {
         atomic_store(&gJPTLogging, [[NSUserDefaults standardUserDefaults] boolForKey:kJPTLoggingKey]);
         JPTProcessReset(JPTUsersPath(), [NSUserDefaults standardUserDefaults]);
-        JPTInitializeNetwork();
-        JPTInstallManagementHook();
+        JPTInitializeNetwork(); JPTInstallManagementHook();
     }
 }
 #endif

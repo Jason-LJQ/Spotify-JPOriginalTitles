@@ -54,7 +54,7 @@ int main(void) {
         JPTProcessReset(users, defaults);
         Check(!Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
               && !Exists([users stringByAppendingPathComponent:@"two-user/primary.ldb"])
-              && Exists(storage) && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6"], @"migration resets only target databases and stays v6");
+              && Exists(storage) && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6.1"], @"migration resets only target databases and stays v6.1");
         CreateDatabase(users, @"one-user");
         JPTProcessReset(users, defaults);
         Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]), @"same version does not repeat migration");
@@ -97,6 +97,20 @@ int main(void) {
         JPTProcessReset(bad, defaults);
         Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"failed"] boolValue]
               && ![defaults dictionaryForKey:kJPTPendingResetKey][@"remaining"], @"enumeration failure is not success and retry will re-enumerate");
+        [defaults removeObjectForKey:kJPTPendingResetKey];
+        [defaults setObject:@"6" forKey:kJPTCacheVersionKey];
+        CreateDatabase(users, @"one-user");
+        JPTProcessReset(users, defaults);
+        Check(!Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
+              && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6.1"], @"v6 cache migrates once to v6.1");
+        Check(JPTSavePendingReset(defaults, @"metadata", NO)
+              && [[defaults dictionaryForKey:kJPTPendingResetKey][@"scope"] isEqualToString:@"metadata"], @"Apply persists selected reset before exit");
+        [defaults setObject:@{@"scope": @"metadata", @"failed": @YES, @"remaining": @[@"one-user"]} forKey:kJPTPendingResetKey];
+        Check(JPTSavePendingReset(defaults, @"metadata", YES)
+              && ![defaults dictionaryForKey:kJPTPendingResetKey][@"failed"]
+              && [[defaults dictionaryForKey:kJPTPendingResetKey][@"remaining"] isEqual:@[@"one-user"]], @"Apply retry retains only failed targets");
+        [defaults removeObjectForKey:kJPTPendingResetKey];
+        Check(!JPTSavePendingReset(defaults, @"metadata", YES), @"Apply retry without saved request does not quit");
         [defaults removePersistentDomainForName:suite];
         [fm removeItemAtPath:root error:nil];
     }

@@ -152,6 +152,8 @@ static NSString *JPTBase62(const uint8_t *gid, size_t len) {
 
 @interface JPTTrackInfo : NSObject
 @property (nonatomic, copy) NSString *name;
+@property (nonatomic, copy) NSString *originalTitle;
+@property (nonatomic, copy) NSString *versionTitle;
 @property (nonatomic, copy) NSString *albumName;
 @property (nonatomic, copy) NSString *albumURI;
 @property (nonatomic, copy) NSString *canonicalURI;
@@ -172,7 +174,7 @@ static BOOL JPTParseEntity(const uint8_t *p, size_t len, NSString **name, NSStri
     return ok;
 }
 
-// Track: 2 name, 3 album {1 gid, 2 name}, 4 artist {1 gid, 2 name}, 36 canonical_uri
+// Track: 2 name, 3 album, 4 artists, 27 original_title, 28 version_title, 36 canonical_uri
 static JPTTrackInfo *JPTParseTrack(const uint8_t *p, size_t len) {
     JPTTrackInfo *info = [JPTTrackInfo new];
     info.artists = [NSMutableArray array];
@@ -194,6 +196,10 @@ static JPTTrackInfo *JPTParseTrack(const uint8_t *p, size_t len) {
             if (JPTParseEntity(f.data, f.len, &name, &uri, @"spotify:artist:") && name && uri) {
                 [info.artists addObject:@[name, uri]];
             }
+        } else if (f.field == 27) {
+            info.originalTitle = JPTString(&f);
+        } else if (f.field == 28) {
+            info.versionTitle = JPTString(&f);
         } else if (f.field == 36) {
             info.canonicalURI = JPTString(&f);
         }
@@ -267,7 +273,7 @@ NSData *JPTGunzip(NSData *data) {
 #pragma mark - Request augmentation
 
 // BatchedEntityRequest: 1 header, 2 EntityRequest {1 entity_uri, 2 ExtensionQuery {1 extension_kind, 2 etag}}
-// Returns nil when nothing was added; traitTracks receives every track entity that asks for IdentityTrait,
+// Returns nil when nothing was added; traitTracks receives tracks requesting IdentityTrait or TRACK_V4,
 // artistURIs every artist entity that asks for ARTIST_V4 or IdentityTrait
 NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutableSet<NSString *> *traitTracks,
                           NSMutableSet<NSString *> *artistURIs, NSMutableDictionary<NSNumber *, NSNumber *> *kindCounts) {
@@ -302,7 +308,7 @@ NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutab
                 }
             }
         }
-        if (eok && hasTrait && [uri hasPrefix:@"spotify:track:"]) [traitTracks addObject:uri];
+        if (eok && (hasTrait || hasTrack) && [uri hasPrefix:@"spotify:track:"]) [traitTracks addObject:uri];
         if (eok && (hasTrait || hasArtist) && [uri hasPrefix:@"spotify:artist:"]) [artistURIs addObject:uri];
         if (!eok || !hasTrait || hasTrack || ![uri hasPrefix:@"spotify:track:"]) {
             JPTWriteRaw(out, &f);
@@ -409,6 +415,8 @@ static JPTTrackInfo *JPTMergeInfo(JPTTrackInfo *client, JPTTrackInfo *original) 
     if (!original || original == client) return client;
     JPTTrackInfo *info = [JPTTrackInfo new];
     info.name = JPTPick(client.name, original.name);
+    info.originalTitle = JPTPick(client.originalTitle, original.originalTitle);
+    info.versionTitle = JPTPick(client.versionTitle, original.versionTitle);
     info.albumName = JPTPick(client.albumName, original.albumName);
     info.albumURI = client.albumURI ?: original.albumURI;
     info.canonicalURI = client.canonicalURI;
@@ -439,6 +447,8 @@ static JPTTrackInfo *JPTAdoptOriginal(JPTTrackInfo *own, JPTTrackInfo *original)
     }
     JPTTrackInfo *info = [JPTTrackInfo new];
     info.name = original.name;
+    info.originalTitle = original.originalTitle;
+    info.versionTitle = original.versionTitle;
     info.albumName = original.albumName;
     info.albumURI = original.albumURI;
     info.canonicalURI = original.canonicalURI;
@@ -573,6 +583,41 @@ static NSData *JPTRewriteEntry(const JPTField *entry, NSData *newValue) {
     return ok ? out : nil;
 }
 
+// Change display names only. Playback IDs, restrictions and unknown fields stay byte-for-byte intact.
+static NSData *JPTRewriteTrack(const JPTField *value, JPTTrackInfo *preferred) {
+    if (!preferred) return nil;
+    NSMutableData *out = [NSMutableData dataWithCapacity:value->len];
+    JPTReader r = JPTReaderMake(value->data, value->len);
+    JPTField f;
+    BOOL ok, changed = NO;
+    while (JPTNext(&r, &f, &ok)) {
+        if (f.field == 2 && f.wire == 2 && preferred.name.length
+            && ![JPTString(&f) isEqualToString:preferred.name]) {
+            JPTWriteString(out, 2, preferred.name); changed = YES;
+        } else if ((f.field == 27 || f.field == 28) && f.wire == 2 && preferred.originalTitle.length) {
+            // The client can reconstruct display names from these instead of field 2.
+            NSString *text = f.field == 27 ? preferred.originalTitle : preferred.versionTitle ?: @"";
+            if (![JPTString(&f) isEqualToString:text]) { JPTWriteString(out, f.field, text); changed = YES; }
+            else JPTWriteRaw(out, &f);
+        } else if ((f.field == 3 || f.field == 4 || f.field == 32) && f.wire == 2) {
+            NSString *oldName = nil, *uri = nil;
+            BOOL parsed = JPTParseEntity(f.data, f.len, &oldName, &uri,
+                                        f.field == 3 ? @"spotify:album:" : @"spotify:artist:");
+            NSString *name = f.field == 3 ? preferred.albumName : nil;
+            if (f.field != 3) {
+                for (NSArray<NSString *> *artist in preferred.artists) {
+                    if ([artist[1] isEqualToString:uri]) { name = artist[0]; break; }
+                }
+            }
+            NSData *entity = (parsed && name.length && ![oldName isEqualToString:name])
+                ? JPTReplaceString(f.data, f.len, 2, name, NULL) : nil;
+            if (entity) { JPTWriteData(out, f.field, entity); changed = YES; }
+            else JPTWriteRaw(out, &f);
+        } else JPTWriteRaw(out, &f);
+    }
+    return ok && changed ? out : nil;
+}
+
 // BatchedExtensionResponse: 1 header, 2 EntityExtensionDataArray {1 header, 2 extension_kind, 3 EntityExtensionData}
 // originals: TRACK_V4 fetched in the original-name language (may be the client's own response)
 // artistNames: known artist URI -> original name; renames artist entities and receives newly learned pairs
@@ -608,7 +653,15 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
             if (kind == kKindTrackV4) {
                 // Drop TRACK_V4 entries that the client never asked for
                 if (uri && [added containsObject:uri]) continue;
-                JPTWriteRaw(array, &af);
+                JPTTrackInfo *preferred = parsed && status == 200 ? JPTPreferredInfo(uri, tracks, originals) : nil;
+                NSData *track = preferred ? JPTRewriteTrack(&value, preferred) : nil;
+                NSData *entry = track ? JPTRewriteEntry(&af, track) : nil;
+                if (entry) {
+                    JPTWriteData(array, 3, entry);
+                    JPTLearnArtists(tracks[uri], preferred, artistNames);
+                    [changes addObject:[NSString stringWithFormat:@"TRACK_V4 %@: %@ -> %@ / %@",
+                                        uri, tracks[uri].name, preferred.name, preferred.albumName]];
+                } else JPTWriteRaw(array, &af);
                 kept++;
                 continue;
             }
