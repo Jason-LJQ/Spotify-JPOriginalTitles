@@ -4,6 +4,18 @@ On Spotify iOS 9.1.88, some Japanese tracks show English or romanized titles, wh
 
 This repository contains only the prebuilt `JPOriginalTitles.dylib` and this document.
 
+## Screenshots
+
+Mac desktop app (left) next to the patched Spotify on an iOS 18.6.2 virtual machine (right). Titles and artists match the originals on both sides.
+
+Playlist:
+
+![Playlist: Mac desktop and patched iOS](screenshots/playlist.jpeg)
+
+Album page:
+
+![Album: Mac desktop and patched iOS](screenshots/album.jpeg)
+
 ## Symptom and cause
 
 - The client fetches metadata with `POST https://spclient.wg.spotify.com/extended-metadata/v0/extended-metadata`.
