@@ -4,11 +4,16 @@
 // TRACK_V4 names back into the IdentityTrait payload. Alternative releases are
 // mapped to their canonical (original) release through Track.canonical_uri, and
 // names without CJK text fall back to a zh TRACK_V4 lookup when it has CJK text.
+// Original names are written onto the client's own artist URIs, whose pages are
+// not region-locked; learned artist names also rename artist entities and
+// searchview results.
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <zlib.h>
 
+static const uint64_t kKindArtistV4 = 8;
+static const uint64_t kKindSimpleCard = 97;
 static const uint64_t kKindTrackV4 = 10;
 static const uint64_t kKindIdentityTrait = 178;
 
@@ -262,9 +267,10 @@ NSData *JPTGunzip(NSData *data) {
 #pragma mark - Request augmentation
 
 // BatchedEntityRequest: 1 header, 2 EntityRequest {1 entity_uri, 2 ExtensionQuery {1 extension_kind, 2 etag}}
-// Returns nil when nothing was added; traitTracks receives every track entity that asks for IdentityTrait
+// Returns nil when nothing was added; traitTracks receives every track entity that asks for IdentityTrait,
+// artistURIs every artist entity that asks for ARTIST_V4 or IdentityTrait
 NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutableSet<NSString *> *traitTracks,
-                          NSMutableDictionary<NSNumber *, NSNumber *> *kindCounts) {
+                          NSMutableSet<NSString *> *artistURIs, NSMutableDictionary<NSNumber *, NSNumber *> *kindCounts) {
     NSMutableData *out = [NSMutableData dataWithCapacity:body.length + 64];
     JPTReader r = JPTReaderMake(body.bytes, body.length);
     JPTField f;
@@ -275,7 +281,7 @@ NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutab
             continue;
         }
         NSString *uri = nil;
-        BOOL hasTrait = NO, hasTrack = NO;
+        BOOL hasTrait = NO, hasTrack = NO, hasArtist = NO;
         JPTReader er = JPTReaderMake(f.data, f.len);
         JPTField ef;
         BOOL eok;
@@ -290,12 +296,14 @@ NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutab
                     if (qf.field == 1 && qf.wire == 0) {
                         if (qf.varint == kKindIdentityTrait) hasTrait = YES;
                         if (qf.varint == kKindTrackV4) hasTrack = YES;
+                        if (qf.varint == kKindArtistV4 || qf.varint == kKindSimpleCard) hasArtist = YES;
                         if (kindCounts) kindCounts[@(qf.varint)] = @(kindCounts[@(qf.varint)].unsignedIntegerValue + 1);
                     }
                 }
             }
         }
         if (eok && hasTrait && [uri hasPrefix:@"spotify:track:"]) [traitTracks addObject:uri];
+        if (eok && (hasTrait || hasArtist) && [uri hasPrefix:@"spotify:artist:"]) [artistURIs addObject:uri];
         if (!eok || !hasTrait || hasTrack || ![uri hasPrefix:@"spotify:track:"]) {
             JPTWriteRaw(out, &f);
             continue;
@@ -418,6 +426,27 @@ static JPTTrackInfo *JPTMergeInfo(JPTTrackInfo *client, JPTTrackInfo *original) 
     return info;
 }
 
+// Original names on the client's own artist URIs. Artists of a region-locked original release are separate
+// entities with empty pages; the romanized release lists the same artists in the same order.
+static JPTTrackInfo *JPTAdoptOriginal(JPTTrackInfo *own, JPTTrackInfo *original) {
+    NSUInteger count = own.artists.count;
+    if (count != original.artists.count) return original;
+    for (NSUInteger i = 0; i < count; i++) {
+        for (NSUInteger j = 0; j < count; j++) {
+            // A shared artist at another position means the order differs
+            if (i != j && [own.artists[i][1] isEqualToString:original.artists[j][1]]) return original;
+        }
+    }
+    JPTTrackInfo *info = [JPTTrackInfo new];
+    info.name = original.name;
+    info.albumName = original.albumName;
+    info.albumURI = original.albumURI;
+    info.canonicalURI = original.canonicalURI;
+    info.artists = [NSMutableArray array];
+    for (NSUInteger i = 0; i < count; i++) [info.artists addObject:@[original.artists[i][0], own.artists[i][1]]];
+    return info;
+}
+
 static JPTTrackInfo *JPTPreferredInfo(NSString *uri, NSDictionary<NSString *, JPTTrackInfo *> *tracks,
                                       NSDictionary<NSString *, JPTTrackInfo *> *originals) {
     JPTTrackInfo *own = tracks[uri];
@@ -426,7 +455,38 @@ static JPTTrackInfo *JPTPreferredInfo(NSString *uri, NSDictionary<NSString *, JP
     // Only undo romanization; remasters and same-named singles keep their own metadata
     NSString *canonical = JPTRomanizedCanonical(uri, info);
     JPTTrackInfo *original = canonical ? JPTMergeInfo(tracks[canonical], originals[canonical]) : nil;
-    return (original && JPTHasCJK(original.name)) ? original : info;
+    return (original && JPTHasCJK(original.name)) ? JPTAdoptOriginal(info, original) : info;
+}
+
+// Records artist URI -> original name pairs where the preferred info renamed one of the track's own artists
+static void JPTLearnArtists(JPTTrackInfo *own, JPTTrackInfo *preferred, NSMutableDictionary<NSString *, NSString *> *names) {
+    if (!names) return;
+    for (NSArray<NSString *> *artist in preferred.artists) {
+        if (!JPTHasCJK(artist[0])) continue;
+        for (NSArray<NSString *> *mine in own.artists) {
+            if ([mine[1] isEqualToString:artist[1]] && !JPTHasCJK(mine[0])) names[artist[1]] = artist[0];
+        }
+    }
+}
+
+// Copies a message, replacing the string at `field` (or appending it when absent)
+static NSData *JPTReplaceString(const uint8_t *p, size_t len, uint32_t field, NSString *value, NSString **old) {
+    NSMutableData *out = [NSMutableData dataWithCapacity:len + 32];
+    JPTReader r = JPTReaderMake(p, len);
+    JPTField f;
+    BOOL ok, written = NO;
+    while (JPTNext(&r, &f, &ok)) {
+        if (f.field == field && f.wire == 2 && !written) {
+            if (old) *old = JPTString(&f);
+            JPTWriteString(out, field, value);
+            written = YES;
+        } else {
+            JPTWriteRaw(out, &f);
+        }
+    }
+    if (!ok) return nil;
+    if (!written) JPTWriteString(out, field, value);
+    return out;
 }
 
 static NSString *JPTSummary(NSString *name, NSArray<NSString *> *artists) {
@@ -515,8 +575,9 @@ static NSData *JPTRewriteEntry(const JPTField *entry, NSData *newValue) {
 
 // BatchedExtensionResponse: 1 header, 2 EntityExtensionDataArray {1 header, 2 extension_kind, 3 EntityExtensionData}
 // originals: TRACK_V4 fetched in the original-name language (may be the client's own response)
+// artistNames: known artist URI -> original name; renames artist entities and receives newly learned pairs
 NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<NSString *, JPTTrackInfo *> *originals,
-                           NSMutableArray<NSString *> *changes) {
+                           NSMutableDictionary<NSString *, NSString *> *artistNames, NSMutableArray<NSString *> *changes) {
     NSDictionary<NSString *, JPTTrackInfo *> *tracks = JPTCollectTracks(body);
     if (!tracks) return nil;
 
@@ -526,7 +587,7 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
     BOOL ok;
     while (JPTNext(&r, &f, &ok)) {
         uint64_t kind = (f.field == 2 && f.wire == 2) ? JPTArrayKind(&f) : 0;
-        if (kind != kKindTrackV4 && kind != kKindIdentityTrait) {
+        if (kind != kKindTrackV4 && kind != kKindIdentityTrait && kind != kKindArtistV4 && kind != kKindSimpleCard) {
             JPTWriteRaw(out, &f);
             continue;
         }
@@ -551,12 +612,33 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
                 kept++;
                 continue;
             }
-            JPTTrackInfo *track = uri ? JPTPreferredInfo(uri, tracks, originals) : nil;
+            kept++;
+            if ([uri hasPrefix:@"spotify:artist:"]) {
+                // ARTIST_V4, IdentityTrait and SimpleCardTrait (artist page header) keep the name in field 2
+                NSString *name = artistNames[uri], *oldName = nil;
+                NSData *value2 = (parsed && status == 200 && name) ? JPTReplaceString(value.data, value.len, 2, name, &oldName) : nil;
+                if (value2 && kind == kKindSimpleCard) {
+                    // SimpleCardTrait repeats the title in field 6
+                    NSString *oldTitle = nil;
+                    NSData *value6 = JPTReplaceString(value2.bytes, value2.length, 6, name, &oldTitle);
+                    if (value6 && [oldTitle isEqualToString:oldName]) value2 = value6;
+                }
+                NSData *entry = value2 ? JPTRewriteEntry(&af, value2) : nil;
+                if (entry) {
+                    JPTWriteData(array, 3, entry);
+                    if (![oldName isEqualToString:name]) [changes addObject:[NSString stringWithFormat:@"%@: %@ -> %@", uri, oldName, name]];
+                } else {
+                    JPTWriteRaw(array, &af);
+                }
+                continue;
+            }
+            JPTTrackInfo *track = (uri && kind == kKindIdentityTrait) ? JPTPreferredInfo(uri, tracks, originals) : nil;
             NSString *oldSummary = nil;
             NSData *identity = (parsed && status == 200 && track) ? JPTRewriteIdentity(&value, track, &oldSummary) : nil;
             NSData *entry = identity ? JPTRewriteEntry(&af, identity) : nil;
             if (entry) {
                 JPTWriteData(array, 3, entry);
+                JPTLearnArtists(tracks[uri], track, artistNames);
                 NSMutableArray<NSString *> *artists = [NSMutableArray array];
                 for (NSArray<NSString *> *artist in track.artists) [artists addObject:artist[0]];
                 NSString *newSummary = JPTSummary(track.name, artists);
@@ -566,7 +648,6 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
             } else {
                 JPTWriteRaw(array, &af);
             }
-            kept++;
         }
         if (!aok) return nil;
         if (kind == kKindTrackV4 && kept == 0) continue;
@@ -575,12 +656,241 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
     return ok ? out : nil;
 }
 
+#pragma mark - Search rewrite
+
+// searchview Entity: 1 uri, 2 name, 3 image, 4 artist, 5 track {3 album {1 uri, 2 name}, 4 artist {1 uri, 2 name}},
+// 6 album {1 subtitle, 7 artist {1 uri, 2 name}}, 14 section holding nested entities
+static NSString *JPTEntityURI(const uint8_t *p, size_t len) {
+    JPTReader r = JPTReaderMake(p, len);
+    JPTField f;
+    BOOL ok;
+    if (!JPTNext(&r, &f, &ok) || f.field != 1 || f.wire != 2) return nil;
+    NSString *uri = JPTString(&f);
+    if (![uri hasPrefix:@"spotify:"]) return nil;
+    while (JPTNext(&r, &f, &ok)) {}
+    return ok ? uri : nil;
+}
+
+static BOOL JPTIsMessage(const uint8_t *p, size_t len) {
+    JPTReader r = JPTReaderMake(p, len);
+    JPTField f;
+    BOOL ok = YES;
+    while (JPTNext(&r, &f, &ok)) {}
+    return ok;
+}
+
+typedef NSData *(^JPTEntityRewriter)(NSString *uri, const uint8_t *p, size_t len);
+
+// Rebuilds only the messages that contain a rewritten track/album/artist entity; nil when nothing changed
+static NSData *JPTWalkSearch(const uint8_t *p, size_t len, int depth, JPTEntityRewriter rewrite) {
+    NSMutableData *out = [NSMutableData dataWithCapacity:len];
+    JPTReader r = JPTReaderMake(p, len);
+    JPTField f;
+    BOOL ok, changed = NO;
+    while (JPTNext(&r, &f, &ok)) {
+        NSData *replacement = nil;
+        if (f.wire == 2 && f.len && depth < 8) {
+            NSString *uri = JPTEntityURI(f.data, f.len);
+            if ([uri hasPrefix:@"spotify:track:"] || [uri hasPrefix:@"spotify:album:"] || [uri hasPrefix:@"spotify:artist:"]) {
+                replacement = rewrite(uri, f.data, f.len);
+            } else if (uri || JPTIsMessage(f.data, f.len)) {
+                replacement = JPTWalkSearch(f.data, f.len, depth + 1, rewrite);
+            }
+        }
+        if (replacement) {
+            JPTWriteData(out, f.field, replacement);
+            changed = YES;
+        } else {
+            JPTWriteRaw(out, &f);
+        }
+    }
+    return (ok && changed) ? out : nil;
+}
+
+NSSet<NSString *> *JPTSearchTracks(NSData *body) {
+    NSMutableSet<NSString *> *uris = [NSMutableSet set];
+    JPTWalkSearch(body.bytes, body.length, 0, ^NSData *(NSString *uri, const uint8_t *p, size_t len) {
+        if ([uri hasPrefix:@"spotify:track:"]) [uris addObject:uri];
+        return nil;
+    });
+    return uris;
+}
+
+static NSString *JPTSubString(const JPTField *f, uint32_t field) {
+    JPTReader r = JPTReaderMake(f->data, f->len);
+    JPTField rf;
+    BOOL ok;
+    while (JPTNext(&r, &rf, &ok)) {
+        if (rf.field == field && rf.wire == 2) return JPTString(&rf);
+    }
+    return nil;
+}
+
+// Renames a {1 uri, 2 name} reference or entity; nil when unchanged
+static NSData *JPTRenameReference(const JPTField *f, NSString *name) {
+    NSString *old = JPTSubString(f, 2);
+    NSString *picked = JPTPick(old, name);
+    if (!picked.length || [picked isEqualToString:old]) return nil;
+    return JPTReplaceString(f->data, f->len, 2, picked, nil);
+}
+
+static NSData *JPTRewriteSearchTrack(const uint8_t *p, size_t len, JPTTrackInfo *info, NSString **oldName) {
+    NSMutableData *out = [NSMutableData dataWithCapacity:len + 64];
+    JPTReader r = JPTReaderMake(p, len);
+    JPTField f;
+    BOOL ok, changed = NO;
+    while (JPTNext(&r, &f, &ok)) {
+        if (f.field == 2 && f.wire == 2) {
+            *oldName = JPTString(&f);
+            NSString *name = JPTPick(*oldName, info.name);
+            JPTWriteString(out, 2, name ?: @"");
+            changed |= ![name isEqualToString:*oldName];
+        } else if (f.field == 5 && f.wire == 2) {
+            NSMutableData *track = [NSMutableData dataWithCapacity:f.len + 64];
+            JPTReader tr = JPTReaderMake(f.data, f.len);
+            JPTField tf;
+            BOOL tok;
+            while (JPTNext(&tr, &tf, &tok)) {
+                NSData *replacement = nil;
+                if (tf.field == 3 && tf.wire == 2) {
+                    replacement = JPTRenameReference(&tf, info.albumName);
+                    // The original album page lists the original names; its URI follows the name
+                    if (replacement && info.albumURI) replacement = JPTReplaceString(replacement.bytes, replacement.length, 1, info.albumURI, nil);
+                } else if (tf.field == 4 && tf.wire == 2) {
+                    NSString *uri = JPTSubString(&tf, 1);
+                    for (NSArray<NSString *> *artist in info.artists) {
+                        if ([artist[1] isEqualToString:uri]) replacement = JPTRenameReference(&tf, artist[0]);
+                    }
+                }
+                if (replacement) {
+                    JPTWriteData(track, tf.field, replacement);
+                    changed = YES;
+                } else {
+                    JPTWriteRaw(track, &tf);
+                }
+            }
+            if (!tok) return nil;
+            JPTWriteData(out, 5, track);
+        } else {
+            JPTWriteRaw(out, &f);
+        }
+    }
+    return (ok && changed) ? out : nil;
+}
+
+// original: @[original album URI, original album name] or nil
+static NSData *JPTRewriteSearchAlbum(const uint8_t *p, size_t len, NSArray<NSString *> *original,
+                                     NSDictionary<NSString *, NSString *> *artistNames) {
+    NSMutableData *out = [NSMutableData dataWithCapacity:len + 64];
+    JPTReader r = JPTReaderMake(p, len);
+    JPTField f;
+    BOOL ok, changed = NO;
+    while (JPTNext(&r, &f, &ok)) {
+        if (f.field == 1 && original) {
+            JPTWriteString(out, 1, original[0]);
+            changed = YES;
+        } else if (f.field == 2 && f.wire == 2 && original) {
+            NSString *old = JPTString(&f), *name = JPTPick(old, original[1]);
+            JPTWriteString(out, 2, name ?: @"");
+            changed |= ![name isEqualToString:old];
+        } else if (f.field == 6 && f.wire == 2) {
+            // Artist renames, also applied to the subtitle that joins the artist names
+            NSMutableDictionary<NSString *, NSString *> *renames = [NSMutableDictionary dictionary];
+            JPTReader ar = JPTReaderMake(f.data, f.len);
+            JPTField af;
+            BOOL aok;
+            while (JPTNext(&ar, &af, &aok)) {
+                if (af.field != 7 || af.wire != 2) continue;
+                NSString *uri = JPTSubString(&af, 1), *name = JPTSubString(&af, 2);
+                NSData *renamed = artistNames[uri] ? JPTRenameReference(&af, artistNames[uri]) : nil;
+                if (renamed && name.length) renames[name] = JPTPick(name, artistNames[uri]);
+            }
+            if (!aok) return nil;
+            if (!renames.count) {
+                JPTWriteRaw(out, &f);
+                continue;
+            }
+            NSMutableData *album = [NSMutableData dataWithCapacity:f.len + 64];
+            ar = JPTReaderMake(f.data, f.len);
+            while (JPTNext(&ar, &af, &aok)) {
+                if (af.field == 1 && af.wire == 2) {
+                    NSMutableString *subtitle = [JPTString(&af) mutableCopy] ?: [NSMutableString string];
+                    for (NSString *name in renames) [subtitle replaceOccurrencesOfString:name withString:renames[name] options:0 range:NSMakeRange(0, subtitle.length)];
+                    JPTWriteString(album, 1, subtitle);
+                } else if (af.field == 7 && af.wire == 2) {
+                    NSString *uri = JPTSubString(&af, 1);
+                    NSData *renamed = artistNames[uri] ? JPTRenameReference(&af, artistNames[uri]) : nil;
+                    if (renamed) JPTWriteData(album, 7, renamed);
+                    else JPTWriteRaw(album, &af);
+                } else {
+                    JPTWriteRaw(album, &af);
+                }
+            }
+            JPTWriteData(out, 6, album);
+            changed = YES;
+        } else {
+            JPTWriteRaw(out, &f);
+        }
+    }
+    return (ok && changed) ? out : nil;
+}
+
+// originals: TRACK_V4 in the original-name language for the search tracks and their canonical releases
+NSData *JPTRewriteSearch(NSData *body, NSDictionary<NSString *, JPTTrackInfo *> *originals,
+                         NSMutableDictionary<NSString *, NSString *> *artistNames, NSMutableArray<NSString *> *changes) {
+    NSMutableDictionary<NSString *, JPTTrackInfo *> *preferred = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSArray<NSString *> *> *albums = [NSMutableDictionary dictionary];
+    for (NSString *uri in JPTSearchTracks(body)) {
+        JPTTrackInfo *own = originals[uri];
+        JPTTrackInfo *info = JPTPreferredInfo(uri, originals, originals);
+        if (!info) continue;
+        preferred[uri] = info;
+        JPTLearnArtists(own, info, artistNames);
+        if (own.albumURI && info.albumURI && ![own.albumURI isEqualToString:info.albumURI] && info.albumName
+            && JPTHasCJK(info.albumName) && !JPTHasCJK(own.albumName)) {
+            albums[own.albumURI] = @[info.albumURI, info.albumName];
+        }
+    }
+    return JPTWalkSearch(body.bytes, body.length, 0, ^NSData *(NSString *uri, const uint8_t *p, size_t len) {
+        NSData *rewritten = nil;
+        NSString *old = nil, *now = nil;
+        if ([uri hasPrefix:@"spotify:track:"]) {
+            JPTTrackInfo *info = preferred[uri];
+            rewritten = info ? JPTRewriteSearchTrack(p, len, info, &old) : nil;
+            now = info.name;
+        } else if ([uri hasPrefix:@"spotify:album:"]) {
+            rewritten = JPTRewriteSearchAlbum(p, len, albums[uri], artistNames);
+            now = albums[uri][1];
+        } else if (artistNames[uri]) {
+            JPTField f = {0};
+            f.data = p;
+            f.len = len;
+            rewritten = JPTRenameReference(&f, artistNames[uri]);
+            now = artistNames[uri];
+        }
+        if (rewritten) [changes addObject:[NSString stringWithFormat:@"search %@: %@ -> %@", uri, old ?: @"", now ?: @"(artists)"]];
+        return rewritten;
+    });
+}
+
 #ifndef JPT_TEST
 
 #pragma mark - Logging
 
 static void JPTLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+#ifndef JPT_LOGGING
+#define JPT_LOGGING 0
+#endif
+
 static void JPTLog(NSString *format, ...) {
+#if !JPT_LOGGING
+    // Logging is off by default (build with -DJPT_LOGGING=1); remove the file left by earlier versions
+    static dispatch_once_t cleanup;
+    dispatch_once(&cleanup, ^{
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        [[NSFileManager defaultManager] removeItemAtPath:[docs stringByAppendingPathComponent:@"JPOriginalTitles.log"] error:nil];
+    });
+#else
     va_list args;
     va_start(args, format);
     NSString *line = [[NSString alloc] initWithFormat:format arguments:args];
@@ -606,6 +916,7 @@ static void JPTLog(NSString *format, ...) {
         [h writeData:[stamped dataUsingEncoding:NSUTF8StringEncoding]];
         [h closeFile];
     });
+#endif
 }
 
 #pragma mark - Original-name metadata cache
@@ -651,11 +962,78 @@ static void JPTFetchOriginals(NSURLRequest *template, NSData *templateBody, NSSe
     }] resume];
 }
 
+#pragma mark - Learned artist names and request template
+
+static NSString *const kJPTArtistNamesKey = @"JPOriginalTitlesArtistNames";
+static NSMutableDictionary<NSString *, NSString *> *gArtistNames;
+
+static NSMutableDictionary<NSString *, NSString *> *JPTArtistNamesSnapshot(void) {
+    @synchronized (gArtistNames) {
+        return [gArtistNames mutableCopy];
+    }
+}
+
+// Keeps pairs learned from track rewrites so artist pages opened later (or after relaunch) are renamed too
+static void JPTMergeArtistNames(NSDictionary<NSString *, NSString *> *names) {
+    NSDictionary *copy = nil;
+    @synchronized (gArtistNames) {
+        NSUInteger before = gArtistNames.count;
+        BOOL changed = NO;
+        for (NSString *uri in names) {
+            if (![gArtistNames[uri] isEqualToString:names[uri]]) {
+                gArtistNames[uri] = names[uri];
+                changed = YES;
+            }
+        }
+        if (!changed) return;
+        if (gArtistNames.count > 5000) [gArtistNames removeAllObjects];
+        copy = [gArtistNames copy];
+        JPTLog(@"artist names %lu -> %lu", (unsigned long)before, (unsigned long)copy.count);
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:copy forKey:kJPTArtistNamesKey];
+}
+
+static BOOL JPTKnowsAnyArtist(NSSet<NSString *> *uris) {
+    @synchronized (gArtistNames) {
+        for (NSString *uri in uris) {
+            if (gArtistNames[uri]) return YES;
+        }
+    }
+    return NO;
+}
+
+// The latest client extended-metadata request; search rewrites reuse its URL, headers and body header
+static NSURLRequest *gTemplateRequest;
+static NSData *gTemplateBody;
+
+static void JPTSetTemplate(NSURLRequest *request, NSData *body) {
+    @synchronized ([JPTTrackInfo class]) {
+        gTemplateRequest = request;
+        gTemplateBody = body;
+    }
+}
+
+static BOOL JPTTemplate(NSURLRequest *auth, NSURLRequest **request, NSData **body) {
+    @synchronized ([JPTTrackInfo class]) {
+        if (!gTemplateRequest) return NO;
+        NSMutableURLRequest *copy = [gTemplateRequest mutableCopy];
+        // The search request carries the freshest credentials
+        for (NSString *header in @[@"Authorization", @"client-token"]) {
+            NSString *value = [auth valueForHTTPHeaderField:header];
+            if (value) [copy setValue:value forHTTPHeaderField:header];
+        }
+        *request = copy;
+        *body = gTemplateBody;
+        return YES;
+    }
+}
+
 #pragma mark - Hooks
 
 @interface JPTTaskState : NSObject
 @property (nonatomic, strong) NSSet<NSString *> *added;
 @property (nonatomic, strong) NSSet<NSString *> *traitTracks;
+@property (nonatomic) BOOL search;
 @property (nonatomic) BOOL clientIsOriginalLanguage;
 @property (nonatomic, strong) NSData *body;
 @property (nonatomic, strong) NSMutableData *buffer;
@@ -706,8 +1084,19 @@ static BOOL JPTIsOriginalLanguage(NSString *acceptLanguage) {
     return original;
 }
 
+static BOOL JPTIsSearch(NSURLRequest *request) {
+    return [request.HTTPMethod isEqualToString:@"GET"] && [request.URL.path hasSuffix:@"/searchview/v3/search"];
+}
+
 static NSURLRequest *JPTPrepareRequest(NSURLSession *session, NSURLRequest *request, JPTTaskState **stateOut) {
     *stateOut = nil;
+    if (gDelegateClasses.count && JPTIsSearch(request) && JPTIsHookedDelegate(session.delegate)) {
+        JPTTaskState *state = [JPTTaskState new];
+        state.search = YES;
+        state.buffer = [NSMutableData data];
+        *stateOut = state;
+        return request;
+    }
     if (!gDelegateClasses.count || !JPTIsExtendedMetadata(request)) return request;
     NSData *body = request.HTTPBody;
     NSString *delegateName = session.delegate ? NSStringFromClass([session.delegate class]) : @"nil";
@@ -719,13 +1108,16 @@ static NSURLRequest *JPTPrepareRequest(NSURLSession *session, NSURLRequest *requ
                request.HTTPBodyStream != nil, encoding);
         return request;
     }
+    JPTSetTemplate(request, body);
     NSMutableSet<NSString *> *uris = [NSMutableSet set];
     NSMutableSet<NSString *> *traitTracks = [NSMutableSet set];
+    NSMutableSet<NSString *> *artists = [NSMutableSet set];
     NSMutableDictionary<NSNumber *, NSNumber *> *counts = [NSMutableDictionary dictionary];
-    NSData *augmented = JPTAugmentRequest(body, uris, traitTracks, counts);
-    JPTLog(@"request %@%@ kinds %@, traits %lu, added %lu", delegateName, gzip ? @" gzip" : @"", JPTKindSummary(counts),
-           (unsigned long)traitTracks.count, (unsigned long)uris.count);
-    if (!traitTracks.count) return request;
+    NSData *augmented = JPTAugmentRequest(body, uris, traitTracks, artists, counts);
+    BOOL knownArtists = JPTKnowsAnyArtist(artists);
+    JPTLog(@"request %@%@ kinds %@, traits %lu, added %lu%@", delegateName, gzip ? @" gzip" : @"", JPTKindSummary(counts),
+           (unsigned long)traitTracks.count, (unsigned long)uris.count, knownArtists ? @", known artists" : @"");
+    if (!traitTracks.count && !knownArtists) return request;
     JPTTaskState *state = [JPTTaskState new];
     state.added = uris;
     state.traitTracks = traitTracks;
@@ -742,6 +1134,47 @@ static NSURLRequest *JPTPrepareRequest(NSURLSession *session, NSURLRequest *requ
         [copy setValue:[NSString stringWithFormat:@"%lu", (unsigned long)augmented.length] forHTTPHeaderField:@"Content-Length"];
     }
     return copy;
+}
+
+// Fetches TRACK_V4 for the search tracks, then for the canonical releases of romanized ones, then rewrites
+static void JPTFinishSearch(NSURLSession *session, NSURLRequest *searchRequest, NSData *payload, void (^deliver)(NSData *)) {
+    NSSet<NSString *> *uris = JPTSearchTracks(payload);
+    NSURLRequest *template = nil;
+    NSData *templateBody = nil;
+    if (!uris.count || !JPTTemplate(searchRequest, &template, &templateBody)) {
+        JPTLog(@"search %lu bytes, tracks %lu%@", (unsigned long)payload.length, (unsigned long)uris.count,
+               template ? @"" : @", no metadata template yet");
+        deliver(payload);
+        return;
+    }
+    NSOperationQueue *queue = session.delegateQueue;
+    void (^finish)(void) = ^{
+        NSMutableDictionary<NSString *, NSString *> *names = JPTArtistNamesSnapshot();
+        NSMutableArray<NSString *> *changes = [NSMutableArray array];
+        NSData *patched = JPTRewriteSearch(payload, JPTOriginalSnapshot(), names, changes);
+        JPTMergeArtistNames(names);
+        JPTLog(@"search %lu bytes, tracks %lu, changed %lu", (unsigned long)payload.length, (unsigned long)uris.count,
+               (unsigned long)changes.count);
+        for (NSString *change in changes) JPTLog(@"  %@", change);
+        deliver(patched ?: payload);
+    };
+    void (^onQueue)(void) = ^{
+        if (queue) [queue addOperationWithBlock:finish];
+        else finish();
+    };
+    void (^canonicals)(void) = ^{
+        NSDictionary<NSString *, JPTTrackInfo *> *snapshot = JPTOriginalSnapshot();
+        NSSet<NSString *> *missing = JPTMissingOriginals(snapshot, uris, snapshot, NO);
+        if (missing.count) JPTFetchOriginals(template, templateBody, missing, onQueue);
+        else onQueue();
+    };
+    NSDictionary<NSString *, JPTTrackInfo *> *snapshot = JPTOriginalSnapshot();
+    NSMutableSet<NSString *> *own = [NSMutableSet set];
+    for (NSString *uri in uris) {
+        if (!snapshot[uri]) [own addObject:uri];
+    }
+    if (own.count) JPTFetchOriginals(template, templateBody, own, canonicals);
+    else canonicals();
 }
 
 static Method JPTOwnMethod(Class cls, SEL sel) {
@@ -819,6 +1252,10 @@ static void JPTHookDelegate(NSString *name) {
             deliver(payload);
             return;
         }
+        if (state.search) {
+            JPTFinishSearch(session, task.currentRequest ?: task.originalRequest, payload, deliver);
+            return;
+        }
         NSDictionary<NSString *, JPTTrackInfo *> *tracks = JPTCollectTracks(payload);
         BOOL clientOriginal = state.clientIsOriginalLanguage;
         NSDictionary<NSString *, JPTTrackInfo *> *(^originals)(void) = ^NSDictionary<NSString *, JPTTrackInfo *> *{
@@ -828,7 +1265,9 @@ static void JPTHookDelegate(NSString *name) {
         };
         void (^finish)(void) = ^{
             NSMutableArray<NSString *> *changes = [NSMutableArray array];
-            NSData *patched = JPTRewriteResponse(payload, state.added, originals(), changes);
+            NSMutableDictionary<NSString *, NSString *> *names = JPTArtistNamesSnapshot();
+            NSData *patched = JPTRewriteResponse(payload, state.added, originals(), names, changes);
+            JPTMergeArtistNames(names);
             JPTLog(@"response %lu bytes, traits %lu, added %lu, changed %lu%@", (unsigned long)payload.length,
                    (unsigned long)state.traitTracks.count, (unsigned long)state.added.count, (unsigned long)changes.count,
                    patched ? @"" : @", parse failed");
@@ -852,6 +1291,8 @@ static void JPTHookDelegate(NSString *name) {
 __attribute__((constructor)) static void JPTInit(void) {
     @autoreleasepool {
         gOriginalCache = [NSMutableDictionary dictionary];
+        NSDictionary *saved = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTArtistNamesKey];
+        gArtistNames = saved ? [saved mutableCopy] : [NSMutableDictionary dictionary];
         gDelegateClasses = [NSMutableArray array];
         // Native core requests use SPTCoreURLSessionDataDelegate; Swift clients use HttpClientURLSession
         JPTHookDelegate(@"SPTCoreURLSessionDataDelegate");
@@ -870,7 +1311,7 @@ __attribute__((constructor)) static void JPTInit(void) {
 #pragma mark - Metadata cache purge
 
 // Bump when rewrite rules change so stale cached metadata is fetched again after an upgrade
-static NSString *const kJPTCacheVersion = @"5";
+static NSString *const kJPTCacheVersion = @"6";
 static NSString *const kJPTCacheVersionKey = @"JPOriginalTitlesCacheVersion";
 
 // Runs at load time, before Spotify opens its core database; settings and login live elsewhere
