@@ -12,7 +12,7 @@ This repository contains the prebuilt plugins and this document.
 
 ## Screenshots
 
-Mac desktop app (left) next to the patched Spotify on an iOS 18.6.2 virtual machine (right). Titles and artists match the originals on both sides.
+Mac desktop app compared with patched Spotify on an iOS 18.6.2 virtual machine.
 
 Playlist:
 
@@ -20,7 +20,7 @@ Playlist:
 
 Album page:
 
-![Album: Mac desktop and patched iOS](screenshots/album.jpeg)
+![v6 artist page: original Japanese names and working artist links on patched iOS](screenshots/album.jpeg)
 
 ## Symptom and cause
 
