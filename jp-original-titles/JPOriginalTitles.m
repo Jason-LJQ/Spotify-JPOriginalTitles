@@ -249,6 +249,30 @@ static uint64_t JPTArrayKind(const JPTField *array) {
     return 0;
 }
 
+static NSString *JPTEntryStatusSummary(NSData *body) {
+    NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionary];
+    JPTReader r = JPTReaderMake(body.bytes, body.length);
+    JPTField f; BOOL ok;
+    while (JPTNext(&r, &f, &ok)) {
+        if (f.field != 2 || f.wire != 2) continue;
+        uint64_t kind = JPTArrayKind(&f);
+        if (kind != kKindTrackV4 && kind != kKindIdentityTrait) continue;
+        JPTReader ar = JPTReaderMake(f.data, f.len);
+        JPTField af; BOOL aok;
+        while (JPTNext(&ar, &af, &aok)) {
+            if (af.field != 3 || af.wire != 2) continue;
+            NSString *uri = nil; uint64_t status = 0; JPTField value = {0};
+            JPTParseEntry(&af, &uri, &status, &value);
+            NSString *key = [NSString stringWithFormat:@"%llu/%llu", kind, status];
+            counts[key] = @(counts[key].unsignedIntegerValue + 1);
+        }
+    }
+    NSMutableArray *parts = [NSMutableArray array];
+    for (NSString *key in [[counts allKeys] sortedArrayUsingSelector:@selector(compare:)])
+        [parts addObject:[NSString stringWithFormat:@"%@x%@", key, counts[key]]];
+    return [parts componentsJoinedByString:@","];
+}
+
 NSData *JPTGunzip(NSData *data) {
     if (!data.length) return nil;
     z_stream zs = {0};
@@ -273,14 +297,15 @@ NSData *JPTGunzip(NSData *data) {
 #pragma mark - Request augmentation
 
 // BatchedEntityRequest: 1 header, 2 EntityRequest {1 entity_uri, 2 ExtensionQuery {1 extension_kind, 2 etag}}
-// Returns nil when nothing was added; traitTracks receives tracks requesting IdentityTrait or TRACK_V4,
+// Returns nil when unchanged; name-bearing track queries omit etags to receive rewritable payloads.
+// traitTracks receives tracks requesting IdentityTrait or TRACK_V4,
 // artistURIs every artist entity that asks for ARTIST_V4 or IdentityTrait
 NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutableSet<NSString *> *traitTracks,
                           NSMutableSet<NSString *> *artistURIs, NSMutableDictionary<NSNumber *, NSNumber *> *kindCounts) {
     NSMutableData *out = [NSMutableData dataWithCapacity:body.length + 64];
     JPTReader r = JPTReaderMake(body.bytes, body.length);
     JPTField f;
-    BOOL ok;
+    BOOL ok, changed = NO;
     while (JPTNext(&r, &f, &ok)) {
         if (f.field != 2 || f.wire != 2) {
             JPTWriteRaw(out, &f);
@@ -310,19 +335,42 @@ NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutab
         }
         if (eok && (hasTrait || hasTrack) && [uri hasPrefix:@"spotify:track:"]) [traitTracks addObject:uri];
         if (eok && (hasTrait || hasArtist) && [uri hasPrefix:@"spotify:artist:"]) [artistURIs addObject:uri];
-        if (!eok || !hasTrait || hasTrack || ![uri hasPrefix:@"spotify:track:"]) {
+        if (!eok || !(hasTrait || hasTrack) || ![uri hasPrefix:@"spotify:track:"]) {
             JPTWriteRaw(out, &f);
             continue;
         }
-        NSMutableData *entity = [NSMutableData dataWithBytes:f.data length:f.len];
-        NSMutableData *query = [NSMutableData data];
-        JPTWriteVarint(query, (1 << 3) | 0);
-        JPTWriteVarint(query, kKindTrackV4);
-        JPTWriteData(entity, 2, query);
+        NSMutableData *entity = [NSMutableData data];
+        er = JPTReaderMake(f.data, f.len);
+        while (JPTNext(&er, &ef, &eok)) {
+            if (ef.field != 2 || ef.wire != 2) { JPTWriteRaw(entity, &ef); continue; }
+            uint64_t kind = 0;
+            JPTReader qr = JPTReaderMake(ef.data, ef.len);
+            JPTField qf;
+            BOOL qok;
+            while (JPTNext(&qr, &qf, &qok)) if (qf.field == 1 && qf.wire == 0) kind = qf.varint;
+            if (!qok) return nil;
+            if (kind != kKindTrackV4 && kind != kKindIdentityTrait) { JPTWriteRaw(entity, &ef); continue; }
+            NSMutableData *query = [NSMutableData data];
+            qr = JPTReaderMake(ef.data, ef.len);
+            while (JPTNext(&qr, &qf, &qok)) {
+                if (qf.field == 2 && qf.wire == 2) changed = YES;
+                else JPTWriteRaw(query, &qf);
+            }
+            if (!qok) return nil;
+            JPTWriteData(entity, 2, query);
+        }
+        if (!eok) return nil;
+        if (hasTrait && !hasTrack) {
+            NSMutableData *query = [NSMutableData data];
+            JPTWriteVarint(query, (1 << 3) | 0);
+            JPTWriteVarint(query, kKindTrackV4);
+            JPTWriteData(entity, 2, query);
+            [added addObject:uri];
+            changed = YES;
+        }
         JPTWriteData(out, 2, entity);
-        [added addObject:uri];
     }
-    if (!ok || added.count == 0) return nil;
+    if (!ok || !changed) return nil;
     return out;
 }
 
@@ -398,8 +446,8 @@ NSSet<NSString *> *JPTMissingOriginals(NSDictionary<NSString *, JPTTrackInfo *> 
                                       NSDictionary<NSString *, JPTTrackInfo *> *originals, BOOL needOriginal) {
     NSMutableSet<NSString *> *missing = [NSMutableSet set];
     for (NSString *uri in uris) {
-        if (needOriginal && tracks[uri] && !originals[uri]) [missing addObject:uri];
-        NSString *canonical = JPTRomanizedCanonical(uri, tracks[uri]);
+        if ((needOriginal || !tracks[uri]) && !originals[uri]) [missing addObject:uri];
+        NSString *canonical = JPTRomanizedCanonical(uri, tracks[uri] ?: originals[uri]);
         if (canonical && !originals[canonical]) [missing addObject:canonical];
     }
     return missing;
@@ -459,7 +507,7 @@ static JPTTrackInfo *JPTAdoptOriginal(JPTTrackInfo *own, JPTTrackInfo *original)
 
 static JPTTrackInfo *JPTPreferredInfo(NSString *uri, NSDictionary<NSString *, JPTTrackInfo *> *tracks,
                                       NSDictionary<NSString *, JPTTrackInfo *> *originals) {
-    JPTTrackInfo *own = tracks[uri];
+    JPTTrackInfo *own = tracks[uri] ?: originals[uri];
     if (!own) return nil;
     JPTTrackInfo *info = JPTMergeInfo(own, originals[uri]);
     // Only undo romanization; remasters and same-named singles keep their own metadata
@@ -1280,6 +1328,7 @@ static void JPTHookDelegate(NSString *name) {
             NSMutableDictionary<NSString *, NSString *> *names = JPTArtistNamesSnapshot();
             NSData *patched = JPTRewriteResponse(payload, state.added, originals(), names, changes);
             JPTMergeArtistNames(names);
+            JPTLog(@"entry statuses %@", JPTEntryStatusSummary(payload));
             JPTLog(@"response %lu bytes, traits %lu, added %lu, changed %lu%@", (unsigned long)payload.length,
                    (unsigned long)state.traitTracks.count, (unsigned long)state.added.count, (unsigned long)changes.count,
                    patched ? @"" : @", parse failed");
@@ -1293,9 +1342,17 @@ static void JPTHookDelegate(NSString *name) {
         }
         // Deliver later on the delegate queue once original-name metadata is fetched
         NSOperationQueue *queue = session.delegateQueue;
-        JPTFetchOriginals(task.currentRequest ?: task.originalRequest, state.body, missing, ^{
-            if (queue) [queue addOperationWithBlock:finish];
-            else finish();
+        void (^onQueue)(void) = ^{ if (queue) [queue addOperationWithBlock:finish]; else finish(); };
+        NSURLRequest *template = task.currentRequest ?: task.originalRequest;
+        JPTFetchOriginals(template, state.body, missing, ^{
+            NSDictionary *snapshot = originals();
+            NSMutableSet *canonicals = [NSMutableSet set];
+            for (NSString *uri in state.traitTracks) {
+                NSString *canonical = JPTRomanizedCanonical(uri, tracks[uri] ?: snapshot[uri]);
+                if (canonical && !snapshot[canonical]) [canonicals addObject:canonical];
+            }
+            if (canonicals.count) JPTFetchOriginals(template, state.body, canonicals, onQueue);
+            else onQueue();
         });
     }));
 }

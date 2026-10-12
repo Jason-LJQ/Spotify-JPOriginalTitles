@@ -14,6 +14,7 @@ static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
 static NSString *const kJPTPendingResetKey = @"JPOriginalTitlesPendingReset";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
 static NSString *const kJPTBuild = @"v6.1";
+static NSString *const kJPTBuildID = @"20261011-cache-refresh-r2";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
 static BOOL gJPTManagementHookInstalled;
@@ -102,8 +103,12 @@ static BOOL JPTDelegateHooked(NSString *name) {
     return cls && [gDelegateClasses containsObject:cls];
 }
 
+static NSString *JPTUsersPath(void);
+static BOOL JPTDatabaseIsOpen(void);
+
 static NSString *JPTDiagnosticSummary(void) {
     NSMutableArray *lines = [NSMutableArray arrayWithObjects:@"JPOriginalTitles", kJPTBuild,
+        [@"Build: " stringByAppendingString:kJPTBuildID],
         [NSString stringWithFormat:@"Spotify %@ (%@)", [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?",
          [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?"],
         [NSString stringWithFormat:@"iOS %@", [UIDevice currentDevice].systemVersion],
@@ -115,6 +120,18 @@ static NSString *JPTDiagnosticSummary(void) {
     [lines addObject:[NSString stringWithFormat:@"Logging: %@", atomic_load(&gJPTLogging) ? @"on" : @"off"]];
     [lines addObject:[NSString stringWithFormat:@"Original cache: %lu; artist names: %lu", (unsigned long)JPTOriginalSnapshot().count,
                       (unsigned long)JPTArtistNamesSnapshot().count]];
+    NSString *users = JPTUsersPath();
+    [lines addObject:[@"Metadata directory: " stringByAppendingString:users ?: @"unavailable"]];
+    [lines addObject:[@"Foundation home: " stringByAppendingString:NSHomeDirectory() ?: @"unavailable"]];
+    for (NSString *key in @[@"HOME", @"CFFIXED_USER_HOME", @"LC_HOME_PATH"]) {
+        const char *value = getenv(key.UTF8String);
+        if (value) [lines addObject:[NSString stringWithFormat:@"Environment %@: %s", key, value]];
+    }
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSUInteger count = 0;
+    for (NSString *user in [fm contentsOfDirectoryAtPath:users error:nil])
+        if ([fm fileExistsAtPath:[[users stringByAppendingPathComponent:user] stringByAppendingPathComponent:@"primary.ldb"]]) count++;
+    [lines addObject:[NSString stringWithFormat:@"Current databases: %lu; database open: %@", (unsigned long)count, JPTDatabaseIsOpen() ? @"yes" : @"no"]];
     NSDictionary *pending = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTPendingResetKey];
     [lines addObject:[NSString stringWithFormat:@"Pending reset: %@", pending ? JPTScopeName(pending[@"scope"]) : @"none"]];
     [lines addObject:JPTResetSummary()];
@@ -179,6 +196,9 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
             }
             targets = found;
         }
+        if (!targets.count && !pending[@"remaining"]) {
+            [errors addObject:@"no metadata database found; cache version unchanged"];
+        }
         if (open) [errors addObject:@"database already open; deletion skipped"];
         for (NSString *user in targets) {
             // The stored retry list contains directory names only, never arbitrary paths.
@@ -202,6 +222,7 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
     BOOL ok = errors.count == 0;
     NSMutableDictionary *result = [@{@"scope": scope ?: @"plugin", @"date": [NSDate date].description,
         @"success": @(ok), @"removed": @(removed), @"databaseOpen": @(open), @"errors": errors} mutableCopy];
+    result[@"usersPath"] = users ?: @"";
     result[@"targets"] = @(targets.count);
     result[@"usersExist"] = @([[NSFileManager defaultManager] fileExistsAtPath:users]);
     if (pending[@"migration"]) result[@"migration"] = pending[@"migration"];
@@ -277,7 +298,7 @@ static BOOL JPTSavePendingReset(NSUserDefaults *defaults, NSString *scope, BOOL 
     NSDictionary *pending = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTPendingResetKey];
     if (index.section == 0) {
         cell.textLabel.text = @[@"Version", @"Network Hooks", @"Plugin Cache", @"Last Reset"][index.row];
-        if (index.row == 0) cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · Spotify %@", kJPTBuild, [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?"];
+        if (index.row == 0) cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@ · Spotify %@", kJPTBuild, kJPTBuildID, [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?"];
         if (index.row == 1) cell.detailTextLabel.text = [NSString stringWithFormat:@"Core %@ · HttpClient %@", JPTDelegateHooked(@"SPTCoreURLSessionDataDelegate") ? @"installed" : @"unavailable", JPTDelegateHooked(@"Connectivity_HttpClientKit.HttpClientURLSession") ? @"installed" : @"unavailable"];
         if (index.row == 2) cell.detailTextLabel.text = [NSString stringWithFormat:@"Original tracks %lu · Artist names %lu", (unsigned long)JPTOriginalSnapshot().count, (unsigned long)JPTArtistNamesSnapshot().count];
         if (index.row == 3) cell.detailTextLabel.text = JPTResetSummary();

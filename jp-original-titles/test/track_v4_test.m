@@ -182,11 +182,25 @@ int main(void) {
         NSMutableSet *added = [NSMutableSet set], *tracked = [NSMutableSet set], *artistURIs = [NSMutableSet set];
         NSMutableDictionary *counts = [NSMutableDictionary dictionary];
         NSData *augmented = JPTAugmentRequest(Request(ownURI, @[@10]), added, tracked, artistURIs, counts);
-        Check(!augmented && !added.count && [tracked containsObject:ownURI] && [counts[@10] isEqual:@1],
-              @"TRACK_V4-only request is tracked without adding a query");
+        Check(augmented && !added.count && [tracked containsObject:ownURI] && [counts[@10] isEqual:@1]
+              && !Fields(Fields(Fields(augmented, 2).firstObject, 2).firstObject, 2).count,
+              @"TRACK_V4-only request removes its etag without adding a query");
         [added removeAllObjects]; [tracked removeAllObjects];
         augmented = JPTAugmentRequest(Request(ownURI, @[@178, @10]), added, tracked, artistURIs, counts);
-        Check(!augmented && !added.count && tracked.count == 1, @"mixed existing kinds are tracked once without augmentation");
+        Check(augmented && !added.count && tracked.count == 1, @"mixed existing name queries are refreshed without duplicate queries");
+        BOOL noEtags = YES;
+        for (NSData *query in Fields(Fields(augmented, 2).firstObject, 2)) if (Fields(query, 2).count) noEtags = NO;
+        Check(noEtags, @"both TRACK_V4 and IdentityTrait validators are removed");
+        NSData *once = augmented;
+        Check(!JPTAugmentRequest(once, [NSMutableSet set], [NSMutableSet set], [NSMutableSet set], nil),
+              @"unconditional existing queries remain byte-for-byte unchanged");
+        NSData *mixedKinds = JPTAugmentRequest(Request(ownURI, @[@178, @10, @179]), [NSMutableSet set], [NSMutableSet set], [NSMutableSet set], nil);
+        NSArray *queries = Fields(Fields(mixedKinds, 2).firstObject, 2);
+        Check([String(queries[2], 2) isEqual:@"existing etag"] && !Fields(queries[0], 2).count && !Fields(queries[1], 2).count,
+              @"unrelated extension validators remain intact");
+        NSData *artistRequest = Request(URI(@"artist", 10), @[@178]);
+        Check(!JPTAugmentRequest(artistRequest, [NSMutableSet set], [NSMutableSet set], [NSMutableSet set], nil),
+              @"artist requests retain their cache validators");
         [added removeAllObjects]; [tracked removeAllObjects];
         augmented = JPTAugmentRequest(Request(ownURI, @[@178]), added, tracked, artistURIs, counts);
         Check(augmented && [added containsObject:ownURI] && [tracked containsObject:ownURI],
@@ -301,6 +315,17 @@ int main(void) {
               [String(contributors[1], 2) isEqual:URI(@"artist", 13)] &&
               [String(contributors[0], 1) isEqual:@"かぐや（cv.夏吉ゆうこ）"],
               @"IdentityTrait keeps international artist page URIs while adopting Japanese names");
+
+        NSMutableDictionary *saved = [originals mutableCopy];
+        [saved addEntriesFromDictionary:JPTCollectTracks(body)];
+        NSData *identityOnly = Response(@[Array(178, @[Entry(ownURI, identity, 200)])]);
+        NSData *repaired = Rewrite(identityOnly, [NSSet set], saved, [NSMutableDictionary dictionary]);
+        Check([String(Payload(repaired, 178, ownURI), 2) isEqual:@"ray - 超かぐや姫！Version"],
+              @"IdentityTrait can use a cached own track when the response omits TRACK_V4");
+        Check([JPTMissingOriginals(@{}, [NSSet setWithObject:ownURI], @{}, NO) containsObject:ownURI],
+              @"missing own TRACK_V4 is fetched even for a Chinese client");
+        Check([JPTMissingOriginals(@{}, [NSSet setWithObject:ownURI], JPTCollectTracks(body), NO) containsObject:originalURI],
+              @"canonical lookup continues after recovering a missing own track");
 
         NSData *errorBody = Response(@[Array(10, @[Entry(ownURI, ownTrack, 404)])]);
         Check([Rewrite(errorBody, [NSSet set], originals, [NSMutableDictionary dictionary]) isEqual:errorBody] &&

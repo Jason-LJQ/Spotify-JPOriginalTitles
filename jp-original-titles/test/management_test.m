@@ -111,6 +111,12 @@ int main(void) {
               && [[defaults dictionaryForKey:kJPTPendingResetKey][@"remaining"] isEqual:@[@"one-user"]], @"Apply retry retains only failed targets");
         [defaults removeObjectForKey:kJPTPendingResetKey];
         Check(!JPTSavePendingReset(defaults, @"metadata", YES), @"Apply retry without saved request does not quit");
+        [defaults removeObjectForKey:kJPTPendingResetKey];
+        [defaults removeObjectForKey:kJPTLastResetKey];
+        [defaults setObject:@"6" forKey:kJPTCacheVersionKey];
+        JPTProcessReset([root stringByAppendingPathComponent:@"missing-users"], defaults);
+        Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"failed"] boolValue]
+              && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6"], @"missing metadata directory never marks migration complete");
         [defaults removePersistentDomainForName:suite];
         [fm removeItemAtPath:root error:nil];
     }
