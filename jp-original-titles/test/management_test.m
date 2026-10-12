@@ -58,10 +58,7 @@ int main(void) {
         Check(!Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
               && !Exists([users stringByAppendingPathComponent:@"two-user/primary.ldb"])
               && Exists(storage) && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6.1"], @"migration resets only target databases and stays v6.1");
-        NSArray *backups = [defaults dictionaryForKey:kJPTLastResetKey][@"resumeBackups"];
-        Check(!Exists(resume) && backups.count == 1
-              && [[NSData dataWithContentsOfFile:backups.firstObject] isEqualToData:resumeData],
-              @"metadata reset preserves playback state bytes in a backup and prevents automatic restoration");
+        Check(Exists(resume), @"metadata migration leaves playback resume state untouched");
         CreateDatabase(users, @"one-user");
         JPTProcessReset(users, defaults);
         Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]), @"same version does not repeat migration");
@@ -110,14 +107,14 @@ int main(void) {
         JPTProcessReset(users, defaults);
         Check(!Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
               && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6.1"], @"v6 cache migrates once to v6.1");
-        Check(JPTSavePendingReset(defaults, @"metadata", NO)
+        Check(JPTSavePendingReset(defaults, @"metadata", NO, NO)
               && [[defaults dictionaryForKey:kJPTPendingResetKey][@"scope"] isEqualToString:@"metadata"], @"Apply persists selected reset before exit");
         [defaults setObject:@{@"scope": @"metadata", @"failed": @YES, @"remaining": @[@"one-user"]} forKey:kJPTPendingResetKey];
-        Check(JPTSavePendingReset(defaults, @"metadata", YES)
+        Check(JPTSavePendingReset(defaults, @"metadata", NO, YES)
               && ![defaults dictionaryForKey:kJPTPendingResetKey][@"failed"]
               && [[defaults dictionaryForKey:kJPTPendingResetKey][@"remaining"] isEqual:@[@"one-user"]], @"Apply retry retains only failed targets");
         [defaults removeObjectForKey:kJPTPendingResetKey];
-        Check(!JPTSavePendingReset(defaults, @"metadata", YES), @"Apply retry without saved request does not quit");
+        Check(!JPTSavePendingReset(defaults, @"metadata", NO, YES), @"Apply retry without saved request does not quit");
         [defaults removeObjectForKey:kJPTPendingResetKey];
         [defaults removeObjectForKey:kJPTLastResetKey];
         [defaults setObject:@"6" forKey:kJPTCacheVersionKey];
@@ -127,12 +124,36 @@ int main(void) {
         [defaults removeObjectForKey:kJPTPendingResetKey];
         [defaults setObject:@"6.1" forKey:kJPTCacheVersionKey];
         CreateDatabase(users, @"one-user");
+        [fm removeItemAtPath:resume error:nil];
         [fm createSymbolicLinkAtPath:resume withDestinationPath:outside error:nil];
-        [defaults setObject:@{@"scope": @"metadata"} forKey:kJPTPendingResetKey];
+        [defaults setObject:@{@"scope": @"metadata", @"playback": @YES} forKey:kJPTPendingResetKey];
         JPTProcessReset(users, defaults);
         Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"failed"] boolValue]
               && Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]) && Exists(outside),
               @"unsafe playback-state link is preserved and prevents database deletion");
+        [fm removeItemAtPath:resume error:nil];
+        [resumeData writeToFile:resume atomically:YES];
+        [defaults setObject:@{@"artist": @"name"} forKey:kJPTArtistNamesKey];
+        Check(JPTSavePendingReset(defaults, @"playback", YES, NO), @"playback-only Apply persists the third option");
+        JPTProcessReset(users, defaults);
+        Check(!Exists(resume) && Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
+              && [defaults objectForKey:kJPTArtistNamesKey], @"playback-only reset preserves metadata and plugin caches");
+        Check([[defaults dictionaryForKey:kJPTLastResetKey][@"playbackRemoved"] unsignedIntegerValue] == 1
+              && ![defaults dictionaryForKey:kJPTLastResetKey][@"resumeBackups"], @"playback reset deletes directly without creating backup records");
+        [resumeData writeToFile:resume atomically:YES];
+        JPTSavePendingReset(defaults, @"metadata", NO, NO);
+        JPTProcessReset(users, defaults);
+        Check(Exists(resume), @"explicit metadata-only reset does not select playback implicitly");
+        CreateDatabase(users, @"one-user");
+        JPTSavePendingReset(defaults, @"metadata", YES, NO);
+        JPTProcessReset(users, defaults);
+        Check(!Exists(resume) && !Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]),
+              @"combined metadata and playback reset clears both selected caches");
+        NSArray *files = [fm contentsOfDirectoryAtPath:[users stringByAppendingPathComponent:@"one-user"] error:nil];
+        Check(!files.count, @"selected playback deletion leaves no backup file");
+        [defaults setObject:@{@"scope": @"metadata", @"playback": @YES, @"failed": @YES, @"remaining": @[@"one-user"]} forKey:kJPTPendingResetKey];
+        JPTSavePendingReset(defaults, @"metadata", NO, YES);
+        Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"playback"] boolValue], @"retry retains the failed playback selection");
         [defaults removePersistentDomainForName:suite];
         [fm removeItemAtPath:root error:nil];
     }
