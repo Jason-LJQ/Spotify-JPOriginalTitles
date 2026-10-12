@@ -14,7 +14,7 @@ static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
 static NSString *const kJPTPendingResetKey = @"JPOriginalTitlesPendingReset";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
 static NSString *const kJPTBuild = @"v6.1";
-static NSString *const kJPTBuildID = @"20261011-cache-refresh-r2";
+static NSString *const kJPTBuildID = @"20261012-resume-cache-r3";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
 static BOOL gJPTManagementHookInstalled;
@@ -152,7 +152,7 @@ static NSString *JPTUsersPath(void) {
 static BOOL JPTDatabaseIsOpen(void) {
     char path[PATH_MAX];
     for (int fd = 0, max = getdtablesize(); fd < max; fd++) {
-        if (fcntl(fd, F_GETPATH, path) == 0 && strstr(path, "/primary.ldb/")) return YES;
+        if (fcntl(fd, F_GETPATH, path) == 0 && (strstr(path, "/primary.ldb/") || strstr(path, "/context_player_state_restore"))) return YES;
     }
     return NO;
 }
@@ -174,6 +174,7 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
     NSString *scope = pending[@"scope"];
     NSMutableArray *errors = [NSMutableArray array];
     NSMutableArray *remaining = [NSMutableArray array];
+    NSMutableArray *resumeBackups = [NSMutableArray array];
     NSUInteger removed = 0;
     NSArray *targets = nil;
     BOOL targetListKnown = NO;
@@ -192,7 +193,8 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
             NSMutableArray *found = [NSMutableArray array];
             for (NSString *user in entries) {
                 NSString *path = [[users stringByAppendingPathComponent:user] stringByAppendingPathComponent:@"primary.ldb"];
-                if ([fm fileExistsAtPath:path]) [found addObject:user];
+                NSString *resume = [[users stringByAppendingPathComponent:user] stringByAppendingPathComponent:@"context_player_state_restore"];
+                if ([fm fileExistsAtPath:path] || [fm fileExistsAtPath:resume]) [found addObject:user];
             }
             targets = found;
         }
@@ -208,9 +210,23 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
             }
             NSString *dir = [users stringByAppendingPathComponent:user];
             NSString *db = [dir stringByAppendingPathComponent:@"primary.ldb"];
-            if (![fm fileExistsAtPath:db]) continue;
             NSError *error = nil;
-            BOOL safe = !open && JPTPlainDirectory(users) && JPTPlainDirectory(dir) && JPTPlainDirectory(db);
+            BOOL safeParent = !open && JPTPlainDirectory(users) && JPTPlainDirectory(dir);
+            NSString *resume = [dir stringByAppendingPathComponent:@"context_player_state_restore"];
+            if ([fm fileExistsAtPath:resume]) {
+                struct stat info;
+                NSString *backup = [dir stringByAppendingPathComponent:[@".jpt-resume-backup-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+                BOOL safeResume = safeParent && lstat(resume.fileSystemRepresentation, &info) == 0 && S_ISREG(info.st_mode);
+                // Keep the old playback state, but prevent it from repopulating stale metadata on launch.
+                if (safeResume && [fm moveItemAtPath:resume toPath:backup error:&error]) [resumeBackups addObject:backup];
+                else {
+                    [remaining addObject:user];
+                    [errors addObject:error ? [NSString stringWithFormat:@"resume backup %@/%ld", error.domain, (long)error.code] : @"unsafe/open playback state; reset skipped"];
+                    continue;
+                }
+            }
+            if (![fm fileExistsAtPath:db]) continue;
+            BOOL safe = safeParent && JPTPlainDirectory(db);
             if (safe && [fm removeItemAtPath:db error:&error]) removed++;
             else {
                 [remaining addObject:user];
@@ -224,6 +240,7 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
         @"success": @(ok), @"removed": @(removed), @"databaseOpen": @(open), @"errors": errors} mutableCopy];
     result[@"usersPath"] = users ?: @"";
     result[@"targets"] = @(targets.count);
+    result[@"resumeBackups"] = resumeBackups;
     result[@"usersExist"] = @([[NSFileManager defaultManager] fileExistsAtPath:users]);
     if (pending[@"migration"]) result[@"migration"] = pending[@"migration"];
     [defaults setObject:result forKey:kJPTLastResetKey];
@@ -237,7 +254,7 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
         [defaults setObject:pending forKey:kJPTPendingResetKey];
     }
     [defaults synchronize];
-    JPTLog(@"startup reset %@: removed %lu, open %d, errors %lu", scope, (unsigned long)removed, open, (unsigned long)errors.count);
+    JPTLog(@"startup reset %@: removed %lu, resume backups %lu, open %d, errors %lu", scope, (unsigned long)removed, (unsigned long)resumeBackups.count, open, (unsigned long)errors.count);
 }
 
 // Persist before quitting; retries retain only the targets that previously failed.
@@ -278,7 +295,7 @@ static BOOL JPTSavePendingReset(NSUserDefaults *defaults, NSString *scope, BOOL 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section { return @[@"Status", @"Diagnostics", @"Reset Options"][section]; }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 1) return @"Logging is off by default. Logs may include track names and URIs. No authentication tokens or full responses are recorded. Two log files are retained, up to 1 MB each.";
-    if (section == 2) return @"Select reset options, then tap Apply. Apply saves the request and closes the app immediately. Reopen Spotify to complete the reset. Metadata reset requires online resync and may discard unsynced offline changes. Login, settings and audio files are kept; downloaded offline playback after reset is unverified.";
+    if (section == 2) return @"Select reset options, then tap Apply. Apply saves the request and closes the app immediately. Reopen Spotify to complete the reset. Metadata reset requires online resync and may discard unsynced offline changes. The current playback queue and position reset; the previous playback state is backed up. Login, settings and audio files are kept; downloaded offline playback after reset is unverified.";
     return nil;
 }
 - (void)checkbox:(UITableViewCell *)cell selected:(BOOL)selected identifier:(NSString *)identifier {

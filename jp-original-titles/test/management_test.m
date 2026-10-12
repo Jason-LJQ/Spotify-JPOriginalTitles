@@ -51,10 +51,17 @@ int main(void) {
         CreateDatabase(users, @"one-user"); CreateDatabase(users, @"two-user");
         NSString *storage = [root stringByAppendingPathComponent:@"PersistentCache/Storage"];
         [fm createDirectoryAtPath:storage withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *resume = [users stringByAppendingPathComponent:@"one-user/context_player_state_restore"];
+        NSData *resumeData = [@"saved playback state" dataUsingEncoding:NSUTF8StringEncoding];
+        [resumeData writeToFile:resume atomically:YES];
         JPTProcessReset(users, defaults);
         Check(!Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
               && !Exists([users stringByAppendingPathComponent:@"two-user/primary.ldb"])
               && Exists(storage) && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6.1"], @"migration resets only target databases and stays v6.1");
+        NSArray *backups = [defaults dictionaryForKey:kJPTLastResetKey][@"resumeBackups"];
+        Check(!Exists(resume) && backups.count == 1
+              && [[NSData dataWithContentsOfFile:backups.firstObject] isEqualToData:resumeData],
+              @"metadata reset preserves playback state bytes in a backup and prevents automatic restoration");
         CreateDatabase(users, @"one-user");
         JPTProcessReset(users, defaults);
         Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]), @"same version does not repeat migration");
@@ -117,6 +124,15 @@ int main(void) {
         JPTProcessReset([root stringByAppendingPathComponent:@"missing-users"], defaults);
         Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"failed"] boolValue]
               && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6"], @"missing metadata directory never marks migration complete");
+        [defaults removeObjectForKey:kJPTPendingResetKey];
+        [defaults setObject:@"6.1" forKey:kJPTCacheVersionKey];
+        CreateDatabase(users, @"one-user");
+        [fm createSymbolicLinkAtPath:resume withDestinationPath:outside error:nil];
+        [defaults setObject:@{@"scope": @"metadata"} forKey:kJPTPendingResetKey];
+        JPTProcessReset(users, defaults);
+        Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"failed"] boolValue]
+              && Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]) && Exists(outside),
+              @"unsafe playback-state link is preserved and prevents database deletion");
         [defaults removePersistentDomainForName:suite];
         [fm removeItemAtPath:root error:nil];
     }
