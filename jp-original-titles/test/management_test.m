@@ -57,7 +57,7 @@ int main(void) {
         JPTProcessReset(users, defaults);
         Check(!Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
               && !Exists([users stringByAppendingPathComponent:@"two-user/primary.ldb"])
-              && Exists(storage) && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6.1"], @"migration resets only target databases and stays v6.1");
+              && Exists(storage) && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion], @"migration resets only target databases and records the current cache version");
         Check(Exists(resume), @"metadata migration leaves playback resume state untouched");
         CreateDatabase(users, @"one-user");
         JPTProcessReset(users, defaults);
@@ -106,7 +106,7 @@ int main(void) {
         CreateDatabase(users, @"one-user");
         JPTProcessReset(users, defaults);
         Check(!Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
-              && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6.1"], @"v6 cache migrates once to v6.1");
+              && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion], @"v6 cache migrates once to the current cache version");
         Check(JPTSavePendingReset(defaults, @"metadata", NO, NO)
               && [[defaults dictionaryForKey:kJPTPendingResetKey][@"scope"] isEqualToString:@"metadata"], @"Apply persists selected reset before exit");
         [defaults setObject:@{@"scope": @"metadata", @"failed": @YES, @"remaining": @[@"one-user"]} forKey:kJPTPendingResetKey];
@@ -122,7 +122,7 @@ int main(void) {
         Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"failed"] boolValue]
               && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6"], @"missing metadata directory never marks migration complete");
         [defaults removeObjectForKey:kJPTPendingResetKey];
-        [defaults setObject:@"6.1" forKey:kJPTCacheVersionKey];
+        [defaults setObject:kJPTCacheVersion forKey:kJPTCacheVersionKey];
         CreateDatabase(users, @"one-user");
         [fm removeItemAtPath:resume error:nil];
         [fm createSymbolicLinkAtPath:resume withDestinationPath:outside error:nil];

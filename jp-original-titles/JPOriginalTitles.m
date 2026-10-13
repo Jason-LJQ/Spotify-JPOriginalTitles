@@ -1161,7 +1161,8 @@ static NSURLRequest *JPTPrepareRequest(NSURLSession *session, NSURLRequest *requ
     NSData *body = request.HTTPBody;
     NSString *delegateName = session.delegate ? NSStringFromClass([session.delegate class]) : @"nil";
     NSString *encoding = [request valueForHTTPHeaderField:@"Content-Encoding"];
-    BOOL gzip = [encoding caseInsensitiveCompare:@"gzip"] == NSOrderedSame;
+    // A message to nil returns zero, which is also NSOrderedSame.
+    BOOL gzip = encoding.length && [encoding caseInsensitiveCompare:@"gzip"] == NSOrderedSame;
     if (gzip) body = JPTGunzip(body);
     if (!JPTIsHookedDelegate(session.delegate) || !body.length || (encoding.length && !gzip)) {
         JPTLog(@"skip request: delegate=%@ body=%lu stream=%d encoding=%@", delegateName, (unsigned long)body.length,
