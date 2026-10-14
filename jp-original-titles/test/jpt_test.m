@@ -44,7 +44,7 @@ int main(int argc, const char *argv[]) {
         if ([mode isEqualToString:@"search"]) {
             if (argc < 6) return 2;
             NSMutableDictionary *originals = [NSMutableDictionary dictionary];
-            for (int i = 5; i < argc; i++) [originals addEntriesFromDictionary:JPTCollectTracks([NSData dataWithContentsOfFile:@(argv[i])])];
+            for (int i = 5; i < argc; i++) [originals addEntriesFromDictionary:JPTCollectMetadata([NSData dataWithContentsOfFile:@(argv[i])])];
             NSMutableDictionary *names = JPTReadNames(argv[4]);
             NSMutableArray *changes = [NSMutableArray array];
             NSData *out = JPTRewriteSearch(body, originals, names, changes);
@@ -76,15 +76,15 @@ int main(int argc, const char *argv[]) {
         }
         if (argc < 7) return 2;
         if ([mode isEqualToString:@"originals"]) {
-            NSDictionary *tracks = JPTCollectTracks(body);
+            NSDictionary *tracks = JPTCollectMetadata(body);
             NSSet *missing = JPTMissingOriginals(tracks, JPTReadList(argv[3]), @{}, atoi(argv[6]) != 0);
             [JPTTrackRequest([NSData dataWithContentsOfFile:@(argv[4])], missing) writeToFile:@(argv[5]) atomically:YES];
             printf("original fetch %lu uris\n", (unsigned long)missing.count);
             return 0;
         }
         NSMutableDictionary *originals = [NSMutableDictionary dictionary];
-        if (strcmp(argv[5], "-") != 0) [originals addEntriesFromDictionary:JPTCollectTracks([NSData dataWithContentsOfFile:@(argv[5])])];
-        if (atoi(argv[6])) [originals addEntriesFromDictionary:JPTCollectTracks(body)];
+        if (strcmp(argv[5], "-") != 0) [originals addEntriesFromDictionary:JPTCollectMetadata([NSData dataWithContentsOfFile:@(argv[5])])];
+        if (atoi(argv[6])) [originals addEntriesFromDictionary:JPTCollectMetadata(body)];
         const char *namesPath = argc > 7 ? argv[7] : NULL;
         NSMutableDictionary *names = JPTReadNames(namesPath);
         NSMutableArray *changes = [NSMutableArray array];

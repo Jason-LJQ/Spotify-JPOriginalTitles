@@ -2,7 +2,7 @@
 // from relinked IdentityTrait (extension kind 178) metadata, by pairing every
 // IdentityTrait track query with a TRACK_V4 (kind 10) query and copying the
 // TRACK_V4 names back into the IdentityTrait payload. Alternative releases are
-// mapped to their canonical (original) release through Track.canonical_uri, and
+// mapped through Track.canonical_uri or a verified recording match in an associated album, and
 // names without CJK text fall back to a zh TRACK_V4 lookup when it has CJK text.
 // Original names are written onto the client's own artist URIs, whose pages are
 // not region-locked; learned artist names also rename artist entities and
@@ -13,6 +13,7 @@
 #import <zlib.h>
 
 static const uint64_t kKindArtistV4 = 8;
+static const uint64_t kKindAlbumV4 = 9;
 static const uint64_t kKindSimpleCard = 97;
 static const uint64_t kKindTrackV4 = 10;
 static const uint64_t kKindIdentityTrait = 178;
@@ -157,6 +158,10 @@ static NSString *JPTBase62(const uint8_t *gid, size_t len) {
 @property (nonatomic, copy) NSString *albumName;
 @property (nonatomic, copy) NSString *albumURI;
 @property (nonatomic, copy) NSString *canonicalURI;
+@property (nonatomic, copy) NSString *isrc;
+@property (nonatomic) uint64_t duration;
+@property (nonatomic) uint64_t number;
+@property (nonatomic) uint64_t disc;
 @property (nonatomic, strong) NSMutableArray<NSArray<NSString *> *> *artists;
 @end
 
@@ -174,6 +179,38 @@ static BOOL JPTParseEntity(const uint8_t *p, size_t len, NSString **name, NSStri
     return ok;
 }
 
+@interface JPTAlbumInfo : JPTTrackInfo
+@property (nonatomic, copy) NSSet<NSString *> *trackURIs;
+@end
+@implementation JPTAlbumInfo
+@end
+
+// Album field 35 is an observed release association; its schema name is unknown.
+static JPTAlbumInfo *JPTParseAlbum(const uint8_t *p, size_t len) {
+    JPTAlbumInfo *info = [JPTAlbumInfo new];
+    NSMutableSet *tracks = [NSMutableSet set];
+    JPTReader r = JPTReaderMake(p, len); JPTField f; BOOL ok;
+    while (JPTNext(&r, &f, &ok)) {
+        if (f.field == 2) info.name = JPTString(&f);
+        else if (f.field == 18) info.originalTitle = JPTString(&f);
+        else if (f.field == 35) {
+            NSString *uri = JPTString(&f);
+            if ([uri hasPrefix:@"spotify:album:"] && uri.length == 36) info.canonicalURI = uri;
+        } else if (f.field == 11 && f.wire == 2) {
+            JPTReader dr = JPTReaderMake(f.data, f.len); JPTField df; BOOL dok;
+            while (JPTNext(&dr, &df, &dok)) {
+                if (df.field != 3 || df.wire != 2) continue;
+                NSString *name = nil, *uri = nil;
+                if (!JPTParseEntity(df.data, df.len, &name, &uri, @"spotify:track:")) return nil;
+                if (uri) [tracks addObject:uri];
+            }
+            if (!dok) return nil;
+        }
+    }
+    info.trackURIs = tracks;
+    return ok && info.name.length ? info : nil;
+}
+
 // Track: 2 name, 3 album, 4 artists, 27 original_title, 28 version_title, 36 canonical_uri
 static JPTTrackInfo *JPTParseTrack(const uint8_t *p, size_t len) {
     JPTTrackInfo *info = [JPTTrackInfo new];
@@ -182,8 +219,23 @@ static JPTTrackInfo *JPTParseTrack(const uint8_t *p, size_t len) {
     JPTField f;
     BOOL ok;
     while (JPTNext(&r, &f, &ok)) {
+        if (f.wire == 0) {
+            if (f.field == 5) info.number = f.varint;
+            else if (f.field == 6) info.disc = f.varint;
+            else if (f.field == 7) info.duration = f.varint;
+            continue;
+        }
         if (f.wire != 2) continue;
-        if (f.field == 2) {
+        if (f.field == 10) {
+            NSString *type = nil, *value = nil;
+            JPTReader er = JPTReaderMake(f.data, f.len); JPTField ef; BOOL eok;
+            while (JPTNext(&er, &ef, &eok)) {
+                if (ef.field == 1) type = JPTString(&ef);
+                else if (ef.field == 2) value = JPTString(&ef);
+            }
+            if (!eok) return nil;
+            if ([type isEqualToString:@"isrc"]) info.isrc = value;
+        } else if (f.field == 2) {
             info.name = JPTString(&f);
         } else if (f.field == 3) {
             NSString *name = nil, *uri = nil;
@@ -312,7 +364,7 @@ NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutab
             continue;
         }
         NSString *uri = nil;
-        BOOL hasTrait = NO, hasTrack = NO, hasArtist = NO;
+        BOOL hasTrait = NO, hasTrack = NO, hasArtist = NO, hasAlbum = NO;
         JPTReader er = JPTReaderMake(f.data, f.len);
         JPTField ef;
         BOOL eok;
@@ -327,6 +379,7 @@ NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutab
                     if (qf.field == 1 && qf.wire == 0) {
                         if (qf.varint == kKindIdentityTrait) hasTrait = YES;
                         if (qf.varint == kKindTrackV4) hasTrack = YES;
+                        if (qf.varint == kKindAlbumV4) hasAlbum = YES;
                         if (qf.varint == kKindArtistV4 || qf.varint == kKindSimpleCard) hasArtist = YES;
                         if (kindCounts) kindCounts[@(qf.varint)] = @(kindCounts[@(qf.varint)].unsignedIntegerValue + 1);
                     }
@@ -335,7 +388,9 @@ NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutab
         }
         if (eok && (hasTrait || hasTrack) && [uri hasPrefix:@"spotify:track:"]) [traitTracks addObject:uri];
         if (eok && (hasTrait || hasArtist) && [uri hasPrefix:@"spotify:artist:"]) [artistURIs addObject:uri];
-        if (!eok || !(hasTrait || hasTrack) || ![uri hasPrefix:@"spotify:track:"]) {
+        BOOL album = [uri hasPrefix:@"spotify:album:"];
+        if (eok && album && (hasTrait || hasAlbum)) [traitTracks addObject:uri];
+        if (!eok || (!((hasTrait || hasTrack) && [uri hasPrefix:@"spotify:track:"]) && !(album && (hasTrait || hasAlbum)))) {
             JPTWriteRaw(out, &f);
             continue;
         }
@@ -349,7 +404,7 @@ NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutab
             BOOL qok;
             while (JPTNext(&qr, &qf, &qok)) if (qf.field == 1 && qf.wire == 0) kind = qf.varint;
             if (!qok) return nil;
-            if (kind != kKindTrackV4 && kind != kKindIdentityTrait) { JPTWriteRaw(entity, &ef); continue; }
+            if (kind != (album ? kKindAlbumV4 : kKindTrackV4) && kind != kKindIdentityTrait) { JPTWriteRaw(entity, &ef); continue; }
             NSMutableData *query = [NSMutableData data];
             qr = JPTReaderMake(ef.data, ef.len);
             while (JPTNext(&qr, &qf, &qok)) {
@@ -360,10 +415,10 @@ NSData *JPTAugmentRequest(NSData *body, NSMutableSet<NSString *> *added, NSMutab
             JPTWriteData(entity, 2, query);
         }
         if (!eok) return nil;
-        if (hasTrait && !hasTrack) {
+        if (hasTrait && !(album ? hasAlbum : hasTrack)) {
             NSMutableData *query = [NSMutableData data];
             JPTWriteVarint(query, (1 << 3) | 0);
-            JPTWriteVarint(query, kKindTrackV4);
+            JPTWriteVarint(query, album ? kKindAlbumV4 : kKindTrackV4);
             JPTWriteData(entity, 2, query);
             [added addObject:uri];
             changed = YES;
@@ -386,7 +441,7 @@ NSData *JPTTrackRequest(NSData *templateBody, NSSet<NSString *> *uris) {
     for (NSString *uri in uris) {
         NSMutableData *query = [NSMutableData data];
         JPTWriteVarint(query, (1 << 3) | 0);
-        JPTWriteVarint(query, kKindTrackV4);
+        JPTWriteVarint(query, [uri hasPrefix:@"spotify:album:"] ? kKindAlbumV4 : kKindTrackV4);
         NSMutableData *entity = [NSMutableData data];
         JPTWriteString(entity, 1, uri);
         JPTWriteData(entity, 2, query);
@@ -419,6 +474,25 @@ NSDictionary<NSString *, JPTTrackInfo *> *JPTCollectTracks(NSData *body) {
         }
     }
     return ok ? tracks : nil;
+}
+
+static NSDictionary<NSString *, JPTTrackInfo *> *JPTCollectMetadata(NSData *body) {
+    NSMutableDictionary *all = [JPTCollectTracks(body) mutableCopy];
+    if (!all) return nil;
+    JPTReader r = JPTReaderMake(body.bytes, body.length); JPTField f; BOOL ok;
+    while (JPTNext(&r, &f, &ok)) {
+        if (f.field != 2 || f.wire != 2 || JPTArrayKind(&f) != kKindAlbumV4) continue;
+        JPTReader ar = JPTReaderMake(f.data, f.len); JPTField af; BOOL aok;
+        while (JPTNext(&ar, &af, &aok)) {
+            if (af.field != 3 || af.wire != 2) continue;
+            NSString *uri = nil; uint64_t status; JPTField value;
+            if (!JPTParseEntry(&af, &uri, &status, &value) || status != 200 || !uri) continue;
+            JPTAlbumInfo *info = JPTParseAlbum(value.data, value.len);
+            if (info) all[uri] = info;
+        }
+        if (!aok) return nil;
+    }
+    return ok ? all : nil;
 }
 
 // Kana, CJK ideographs and Hangul; romanized releases contain none of these
@@ -468,6 +542,7 @@ static JPTTrackInfo *JPTMergeInfo(JPTTrackInfo *client, JPTTrackInfo *original) 
     info.albumName = JPTPick(client.albumName, original.albumName);
     info.albumURI = client.albumURI ?: original.albumURI;
     info.canonicalURI = client.canonicalURI;
+    info.isrc = client.isrc; info.duration = client.duration; info.number = client.number; info.disc = client.disc;
     info.artists = [NSMutableArray array];
     for (NSArray<NSString *> *artist in client.artists) {
         NSArray<NSString *> *match = nil;
@@ -505,6 +580,35 @@ static JPTTrackInfo *JPTAdoptOriginal(JPTTrackInfo *own, JPTTrackInfo *original)
     return info;
 }
 
+static JPTAlbumInfo *JPTPreferredAlbum(NSString *uri, NSDictionary<NSString *, JPTTrackInfo *> *all) {
+    if (!uri.length) return nil;
+    JPTTrackInfo *own = all[uri];
+    if (![own isKindOfClass:[JPTAlbumInfo class]]) return nil;
+    if (!own.canonicalURI.length || [own.canonicalURI isEqualToString:uri] || JPTHasCJK(own.name))
+        return (JPTAlbumInfo *)own;
+    JPTTrackInfo *linked = all[own.canonicalURI];
+    if (![own.canonicalURI isEqualToString:uri] && [linked isKindOfClass:[JPTAlbumInfo class]]
+        && !JPTHasCJK(own.name) && JPTHasCJK(linked.name)) return (JPTAlbumInfo *)linked;
+    return (JPTAlbumInfo *)own;
+}
+
+static JPTTrackInfo *JPTAlbumOriginal(JPTTrackInfo *own, NSDictionary<NSString *, JPTTrackInfo *> *all) {
+    if (JPTHasCJK(own.name) || !own.isrc.length || !own.duration || !own.number || !own.disc) return nil;
+    JPTAlbumInfo *album = JPTPreferredAlbum(own.albumURI, all);
+    if (!album || !JPTHasCJK(album.name) || !album.trackURIs.count || album.trackURIs.count > 100) return nil;
+    for (NSString *uri in album.trackURIs) if (!all[uri]) return nil;
+    JPTTrackInfo *match = nil;
+    for (NSString *uri in album.trackURIs) {
+        JPTTrackInfo *candidate = all[uri];
+        if (![candidate.isrc isEqualToString:own.isrc]) continue;
+        // Duplicate recordings are ambiguous, even when only one has a matching position.
+        if (match) return nil;
+        match = candidate;
+    }
+    return match && JPTHasCJK(match.name) && match.duration == own.duration
+        && match.number == own.number && match.disc == own.disc ? match : nil;
+}
+
 static JPTTrackInfo *JPTPreferredInfo(NSString *uri, NSDictionary<NSString *, JPTTrackInfo *> *tracks,
                                       NSDictionary<NSString *, JPTTrackInfo *> *originals) {
     JPTTrackInfo *own = tracks[uri] ?: originals[uri];
@@ -513,7 +617,9 @@ static JPTTrackInfo *JPTPreferredInfo(NSString *uri, NSDictionary<NSString *, JP
     // Only undo romanization; remasters and same-named singles keep their own metadata
     NSString *canonical = JPTRomanizedCanonical(uri, info);
     JPTTrackInfo *original = canonical ? JPTMergeInfo(tracks[canonical], originals[canonical]) : nil;
-    return (original && JPTHasCJK(original.name)) ? JPTAdoptOriginal(info, original) : info;
+    if (original && JPTHasCJK(original.name)) return JPTAdoptOriginal(info, original);
+    JPTTrackInfo *albumOriginal = JPTAlbumOriginal(info, originals);
+    return albumOriginal ? JPTAdoptOriginal(info, albumOriginal) : info;
 }
 
 // Records artist URI -> original name pairs where the preferred info renamed one of the track's own artists
@@ -673,6 +779,10 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
                            NSMutableDictionary<NSString *, NSString *> *artistNames, NSMutableArray<NSString *> *changes) {
     NSDictionary<NSString *, JPTTrackInfo *> *tracks = JPTCollectTracks(body);
     if (!tracks) return nil;
+    NSMutableDictionary *metadata = [originals mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSDictionary *clientMetadata = JPTCollectMetadata(body);
+    if (!clientMetadata) return nil;
+    [metadata addEntriesFromDictionary:clientMetadata];
 
     NSMutableData *out = [NSMutableData dataWithCapacity:body.length];
     JPTReader r = JPTReaderMake(body.bytes, body.length);
@@ -680,7 +790,7 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
     BOOL ok;
     while (JPTNext(&r, &f, &ok)) {
         uint64_t kind = (f.field == 2 && f.wire == 2) ? JPTArrayKind(&f) : 0;
-        if (kind != kKindTrackV4 && kind != kKindIdentityTrait && kind != kKindArtistV4 && kind != kKindSimpleCard) {
+        if (kind != kKindTrackV4 && kind != kKindIdentityTrait && kind != kKindArtistV4 && kind != kKindSimpleCard && kind != kKindAlbumV4) {
             JPTWriteRaw(out, &f);
             continue;
         }
@@ -698,6 +808,22 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
             uint64_t status;
             JPTField value;
             BOOL parsed = JPTParseEntry(&af, &uri, &status, &value);
+            if (kind == kKindAlbumV4 || (kind == kKindIdentityTrait && [uri hasPrefix:@"spotify:album:"])) {
+                if (kind == kKindAlbumV4 && [added containsObject:uri]) continue;
+                JPTAlbumInfo *preferred = parsed && status == 200 ? JPTPreferredAlbum(uri, metadata) : nil;
+                NSString *oldName = nil;
+                NSData *renamed = preferred ? JPTReplaceString(value.data, value.len, 2, preferred.name, &oldName) : nil;
+                if (renamed && kind == kKindAlbumV4 && preferred.originalTitle.length)
+                    renamed = JPTReplaceString(renamed.bytes, renamed.length, 18, preferred.originalTitle, NULL);
+                NSData *entry = renamed ? JPTRewriteEntry(&af, renamed) : nil;
+                if (entry) {
+                    JPTWriteData(array, 3, entry);
+                    if (![oldName isEqualToString:preferred.name])
+                        [changes addObject:[NSString stringWithFormat:@"ALBUM %@: %@ -> %@", uri, oldName, preferred.name]];
+                } else JPTWriteRaw(array, &af);
+                kept++;
+                continue;
+            }
             if (kind == kKindTrackV4) {
                 // Drop TRACK_V4 entries that the client never asked for
                 if (uri && [added containsObject:uri]) continue;
@@ -751,7 +877,7 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
             }
         }
         if (!aok) return nil;
-        if (kind == kKindTrackV4 && kept == 0) continue;
+        if ((kind == kKindTrackV4 || kind == kKindAlbumV4) && kept == 0) continue;
         JPTWriteData(out, 2, array);
     }
     return ok ? out : nil;
@@ -1010,7 +1136,7 @@ static void JPTFetchOriginals(NSURLRequest *template, NSData *templateBody, NSSe
     }
     [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         NSInteger code = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
-        NSDictionary<NSString *, JPTTrackInfo *> *tracks = (!error && code == 200) ? JPTCollectTracks(data) : nil;
+        NSDictionary<NSString *, JPTTrackInfo *> *tracks = (!error && code == 200) ? JPTCollectMetadata(data) : nil;
         if (tracks.count) {
             @synchronized (gOriginalCache) {
                 [gOriginalCache addEntriesFromDictionary:tracks];
@@ -1020,6 +1146,45 @@ static void JPTFetchOriginals(NSURLRequest *template, NSData *templateBody, NSSe
                (unsigned long)tracks.count, error ? [NSString stringWithFormat:@", error %@/%ld", error.domain, (long)error.code] : @"");
         done();
     }] resume];
+}
+
+// Resolve one server-provided album association, then fetch only its bounded track set.
+static void JPTFetchAlbumOriginals(NSURLRequest *template, NSData *body, NSSet<NSString *> *uris, void (^done)(void)) {
+    NSDictionary *initial = JPTOriginalSnapshot();
+    NSMutableSet *albums = [NSMutableSet set];
+    for (NSString *uri in uris) {
+        JPTTrackInfo *track = initial[uri];
+        if ([uri hasPrefix:@"spotify:album:"]) [albums addObject:uri];
+        else if (track && !JPTHasCJK(track.name) && track.isrc.length && track.albumURI) [albums addObject:track.albumURI];
+    }
+    if (!albums.count || albums.count > 64) { done(); return; }
+    void (^linkedAlbums)(void) = ^{
+        NSDictionary *own = JPTOriginalSnapshot();
+        NSMutableSet *linked = [NSMutableSet set];
+        for (NSString *uri in albums) {
+            JPTTrackInfo *album = own[uri];
+            if (![album isKindOfClass:[JPTAlbumInfo class]] || JPTHasCJK(album.name)) continue;
+            NSString *target = album.canonicalURI;
+            if ([target hasPrefix:@"spotify:album:"] && ![target isEqualToString:uri] && !own[target]) [linked addObject:target];
+        }
+        void (^albumTracks)(void) = ^{
+            NSDictionary *snapshot = JPTOriginalSnapshot();
+            NSMutableSet *missing = [NSMutableSet set];
+            for (NSString *uri in albums) {
+                JPTAlbumInfo *preferred = JPTPreferredAlbum(uri, snapshot);
+                if (!preferred || !JPTHasCJK(preferred.name) || preferred.trackURIs.count > 100) continue;
+                for (NSString *trackURI in preferred.trackURIs) if (!snapshot[trackURI]) [missing addObject:trackURI];
+            }
+            if (missing.count && missing.count <= 256) JPTFetchOriginals(template, body, missing, done);
+            else done();
+        };
+        if (linked.count) JPTFetchOriginals(template, body, linked, albumTracks);
+        else albumTracks();
+    };
+    NSMutableSet *missing = [NSMutableSet set];
+    for (NSString *uri in albums) if (!initial[uri]) [missing addObject:uri];
+    if (missing.count) JPTFetchOriginals(template, body, missing, linkedAlbums);
+    else linkedAlbums();
 }
 
 #pragma mark - Learned artist names and request template
@@ -1223,11 +1388,12 @@ static void JPTFinishSearch(NSURLSession *session, NSURLRequest *searchRequest, 
         if (queue) [queue addOperationWithBlock:finish];
         else finish();
     };
+    void (^resolveAlbums)(void) = ^{ JPTFetchAlbumOriginals(template, templateBody, uris, onQueue); };
     void (^canonicals)(void) = ^{
         NSDictionary<NSString *, JPTTrackInfo *> *snapshot = JPTOriginalSnapshot();
         NSSet<NSString *> *missing = JPTMissingOriginals(snapshot, uris, snapshot, NO);
-        if (missing.count) JPTFetchOriginals(template, templateBody, missing, onQueue);
-        else onQueue();
+        if (missing.count) JPTFetchOriginals(template, templateBody, missing, resolveAlbums);
+        else resolveAlbums();
     };
     NSDictionary<NSString *, JPTTrackInfo *> *snapshot = JPTOriginalSnapshot();
     NSMutableSet<NSString *> *own = [NSMutableSet set];
@@ -1317,8 +1483,11 @@ static void JPTHookDelegate(NSString *name) {
             JPTFinishSearch(session, task.currentRequest ?: task.originalRequest, payload, deliver);
             return;
         }
-        NSDictionary<NSString *, JPTTrackInfo *> *tracks = JPTCollectTracks(payload);
+        NSDictionary<NSString *, JPTTrackInfo *> *tracks = JPTCollectMetadata(payload);
         BOOL clientOriginal = state.clientIsOriginalLanguage;
+        if (clientOriginal && tracks.count) {
+            @synchronized (gOriginalCache) { [gOriginalCache addEntriesFromDictionary:tracks]; }
+        }
         NSDictionary<NSString *, JPTTrackInfo *> *(^originals)(void) = ^NSDictionary<NSString *, JPTTrackInfo *> *{
             NSMutableDictionary<NSString *, JPTTrackInfo *> *all = [JPTOriginalSnapshot() mutableCopy];
             if (clientOriginal && tracks) [all addEntriesFromDictionary:tracks];
@@ -1337,14 +1506,12 @@ static void JPTHookDelegate(NSString *name) {
             deliver(patched ?: payload);
         };
         NSSet<NSString *> *missing = tracks ? JPTMissingOriginals(tracks, state.traitTracks, originals(), !clientOriginal) : nil;
-        if (!missing.count) {
-            finish();
-            return;
-        }
         // Deliver later on the delegate queue once original-name metadata is fetched
         NSOperationQueue *queue = session.delegateQueue;
         void (^onQueue)(void) = ^{ if (queue) [queue addOperationWithBlock:finish]; else finish(); };
         NSURLRequest *template = task.currentRequest ?: task.originalRequest;
+        void (^resolveAlbums)(void) = ^{ JPTFetchAlbumOriginals(template, state.body, state.traitTracks, onQueue); };
+        if (!missing.count) { resolveAlbums(); return; }
         JPTFetchOriginals(template, state.body, missing, ^{
             NSDictionary *snapshot = originals();
             NSMutableSet *canonicals = [NSMutableSet set];
@@ -1352,8 +1519,8 @@ static void JPTHookDelegate(NSString *name) {
                 NSString *canonical = JPTRomanizedCanonical(uri, tracks[uri] ?: snapshot[uri]);
                 if (canonical && !snapshot[canonical]) [canonicals addObject:canonical];
             }
-            if (canonicals.count) JPTFetchOriginals(template, state.body, canonicals, onQueue);
-            else onQueue();
+            if (canonicals.count) JPTFetchOriginals(template, state.body, canonicals, resolveAlbums);
+            else resolveAlbums();
         });
     }));
 }
