@@ -6,6 +6,7 @@ This repository contains the prebuilt plugins and this document.
 
 | Version | File | Scope |
 | --- | --- | --- |
+| v6.1.2 | [JPOriginalTitles.dylib](jp-original-titles/dist/v6.1.2/JPOriginalTitles.dylib) | v6.1.1, plus original-title matching through associated albums and album title rewriting |
 | v6.1.1 | [JPOriginalTitles.dylib](jp-original-titles/dist/v6.1.1/JPOriginalTitles.dylib) | v6.1, plus uncompressed metadata requests and a refresh of old missed responses |
 | v6.1 | [JPOriginalTitles.dylib](jp-original-titles/dist/v6.1/JPOriginalTitles.dylib) | v6, client TRACK_V4 names and structured titles, a cache refresh and English maintenance controls |
 | v6 | `jp-original-titles/dist/v6/JPOriginalTitles.dylib` | v5, plus search results and working artist links |
@@ -27,7 +28,7 @@ Album page:
 
 - The client fetches metadata with `POST https://spclient.wg.spotify.com/extended-metadata/v0/extended-metadata`.
 - The server replaces the `IdentityTrait` (extension kind 178) of Japanese originals with a romanized international sibling. 9.1.88 uses this field for the player bar, queue and playlists; 9.1.28 and the Mac app use `TRACK_V4` (kind 10).
-- Playlists reference the romanized URI, but its `canonical_uri` points to the Japanese original.
+- Some international tracks point to the Japanese original through `canonical_uri`; others point to themselves. Associated-album metadata can provide a separate path to the original release.
 - Artist names are localized by the `Accept-Language` header: `en`, `ko` or no header returns English names, `zh-Hans` / `zh-Hant` return the original names, and `ja` turns some Chinese artists into katakana.
 
 These are results observed on one account (one set of tracks, playlists and languages). Other accounts and regions may differ.
@@ -61,12 +62,18 @@ Some tracks briefly showed their Japanese title, then switched to English in the
 
 v6.1.1 only decompresses requests with an explicit gzip header. Its cache version is also 6.1.1: upgrading refreshes the old metadata/library index once, because repairing the hook alone leaves previously cached English IdentityTrait data available. Playback resume state is preserved. The three reset options keep their v6.1 behavior.
 
+### v6.1.2: tracks whose canonical URI points to themselves
+
+v6.1.2 follows the server-provided album association, fetches the associated original album's tracks, and matches a recording by a unique ISRC plus identical duration, disc and track number. Missing data, duplicate ISRCs or mismatched positions keep the existing title. It does not match releases by title or order alone. The observed album association is field 35; its schema name is not confirmed in the inspected 9.1.88 descriptor.
+
+The same matching feeds track IdentityTrait, client-requested TRACK_V4 and search track rewriting. Album names in ALBUM_V4 and album IdentityTrait are also rewritten while retaining the album's own ID and track order. Additional queries follow one association level and have bounded album/track counts; failed lookups keep the available values.
+
 ## Usage
 
 Requirements: Spotify iOS 9.1.88 and an app that already loads `Frameworks/*.dylib` through a plugin manager (it was tested with a build that ships LoadControl).
 
-1. Download v6.1.1 from the table above and put `JPOriginalTitles.dylib` into `Payload/Spotify.app/Frameworks/` (mode 755), then repackage and install. Use one version only; all versions have the same filename. Physical LiveContainer validation is pending.
-2. On the first launch after upgrading from a cache version other than 6.1.1, the plugin removes `Library/Application Support/PersistentCache/Users/*/primary.ldb` once. This automatic migration leaves playback resume state untouched.
+1. Download v6.1.2 from the table above and put `JPOriginalTitles.dylib` into `Payload/Spotify.app/Frameworks/` (mode 755), then repackage and install. Use one version only; all versions have the same filename. Physical LiveContainer validation is pending.
+2. On the first launch after upgrading from a cache version other than 6.1.2, the plugin removes `Library/Application Support/PersistentCache/Users/*/primary.ldb` once. This automatic migration leaves playback resume state untouched.
 3. Open **Settings and privacy → Original Titles**, directly below **Eevee Settings**. The page is in English.
 4. Select the reset options below, then tap **Apply**. Apply saves the selection and immediately closes Spotify. Reopen Spotify to run only the selected resets.
 
@@ -81,10 +88,10 @@ Login, preferences, Keychain and audio files are kept.
 
 ## Known limitations
 
-- A separate international release whose `canonical_uri` points to itself cannot be mapped to a Japanese release from the available metadata. For example, the English-search ILLIT track `6VedlO2MtaEjAITax6vQyg` stays English; the tested Japanese track is `7LFuSAGcZKLP2EVO4iSzkz`. The plugin does not guess a replacement by title alone.
+- A self-canonical international track still needs a server-provided association to an original album and an unambiguous recording match. Releases without that association remain unchanged.
 - Original-name lookups require the server to return the corresponding metadata. Offline or failed lookups keep the available client values.
 - The large name at the top of an artist page stays in the client language (for example "Yachiyo Runami(cv.Saori Hayami)"), even after a fresh install. Its popular tracks and the artist list in the player are shown in the original language. The menu opened from "More" also stays in English.
-- Search results appear slightly later when the plugin has to fetch metadata for new tracks first (one or two extra requests). Only results of a submitted search were checked; live suggestions while typing were not checked separately.
+- Search results and metadata presentation can appear later when missing originals or associated-album tracks require extra requests. Only results of a submitted search were checked; live suggestions while typing were not checked separately.
 - Region-locked original artists themselves remain empty; v6 avoids opening them instead of unlocking them.
 - Offline playback of downloaded songs after a cache clear is unverified (inference: the first playback may need a connection).
 - It depends on internal Spotify class names (such as `SPTCoreURLSessionDataDelegate`) and protocol fields, so a Spotify update may break it.
@@ -94,6 +101,7 @@ Login, preferences, Keychain and audio files are kept.
 Paths below are relative to the repository root.
 
 ```
+sha256  c53e3fc5489cb22996a5a3313d24c01fa7fc4706eb0c8ff0f6b4dc128a3d2737  jp-original-titles/dist/v6.1.2/JPOriginalTitles.dylib
 sha256  ba538fe23846e6ef874df935b1e4bab64ced43dacd380edbb67dc55d8a4f3d1f  jp-original-titles/dist/v6.1.1/JPOriginalTitles.dylib
 sha256  d61e9933fd65de8bceb05217f8be260678b67fcffc5ffb250d1fa1b1ef36526c  jp-original-titles/dist/v6.1/JPOriginalTitles.dylib
 sha256  e74886344b11261db0e26025001de286fa1475dd941394f4bb7850932cf72c9f  jp-original-titles/dist/v6/JPOriginalTitles.dylib
