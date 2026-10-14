@@ -199,8 +199,9 @@ int main(void) {
         Check([String(queries[2], 2) isEqual:@"existing etag"] && !Fields(queries[0], 2).count && !Fields(queries[1], 2).count,
               @"unrelated extension validators remain intact");
         NSData *artistRequest = Request(URI(@"artist", 10), @[@178]);
-        Check(!JPTAugmentRequest(artistRequest, [NSMutableSet set], [NSMutableSet set], [NSMutableSet set], nil),
-              @"artist requests retain their cache validators");
+        NSData *freshArtist = JPTAugmentRequest(artistRequest, [NSMutableSet set], [NSMutableSet set], [NSMutableSet set], nil);
+        Check(freshArtist && !Fields(Fields(Fields(freshArtist, 2).firstObject, 2).firstObject, 2).count,
+              @"artist name requests refresh their cache validators");
         [added removeAllObjects]; [tracked removeAllObjects];
         augmented = JPTAugmentRequest(Request(ownURI, @[@178]), added, tracked, artistURIs, counts);
         Check(augmented && [added containsObject:ownURI] && [tracked containsObject:ownURI],
