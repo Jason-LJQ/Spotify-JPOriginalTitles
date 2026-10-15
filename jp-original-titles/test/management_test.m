@@ -55,10 +55,15 @@ int main(void) {
         NSData *resumeData = [@"saved playback state" dataUsingEncoding:NSUTF8StringEncoding];
         [resumeData writeToFile:resume atomically:YES];
         JPTProcessReset(users, defaults);
-        Check(!Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
-              && !Exists([users stringByAppendingPathComponent:@"two-user/primary.ldb"])
-              && Exists(storage) && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion], @"migration resets only target databases and records the current cache version");
-        Check(Exists(resume), @"metadata migration leaves playback resume state untouched");
+        Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
+              && Exists([users stringByAppendingPathComponent:@"two-user/primary.ldb"])
+              && Exists(storage) && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion], @"automatic migration preserves Spotify databases and records the plugin revision");
+        Check(Exists(resume), @"plugin migration leaves playback resume state untouched");
+        [defaults setObject:@{@"scope": @"metadata", @"migration": @"6.1.3", @"failed": @YES} forKey:kJPTPendingResetKey];
+        JPTProcessReset(users, defaults);
+        Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
+              && [[[defaults dictionaryForKey:kJPTLastResetKey] objectForKey:@"scope"] isEqualToString:@"plugin"],
+              @"legacy automatic metadata reset becomes a plugin-only migration");
         CreateDatabase(users, @"one-user");
         JPTProcessReset(users, defaults);
         Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]), @"same version does not repeat migration");
@@ -105,8 +110,8 @@ int main(void) {
         [defaults setObject:@"6" forKey:kJPTCacheVersionKey];
         CreateDatabase(users, @"one-user");
         JPTProcessReset(users, defaults);
-        Check(!Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
-              && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion], @"v6 cache migrates once to the current cache version");
+        Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
+              && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion], @"v6 migration preserves Spotify metadata while updating plugin state");
         Check(JPTSavePendingReset(defaults, @"metadata", NO, NO)
               && [[defaults dictionaryForKey:kJPTPendingResetKey][@"scope"] isEqualToString:@"metadata"], @"Apply persists selected reset before exit");
         [defaults setObject:@{@"scope": @"metadata", @"failed": @YES, @"remaining": @[@"one-user"]} forKey:kJPTPendingResetKey];
@@ -119,8 +124,8 @@ int main(void) {
         [defaults removeObjectForKey:kJPTLastResetKey];
         [defaults setObject:@"6" forKey:kJPTCacheVersionKey];
         JPTProcessReset([root stringByAppendingPathComponent:@"missing-users"], defaults);
-        Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"failed"] boolValue]
-              && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:@"6"], @"missing metadata directory never marks migration complete");
+        Check(![defaults dictionaryForKey:kJPTPendingResetKey]
+              && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion], @"plugin migration succeeds without a Spotify metadata directory");
         [defaults removeObjectForKey:kJPTPendingResetKey];
         [defaults setObject:kJPTCacheVersion forKey:kJPTCacheVersionKey];
         CreateDatabase(users, @"one-user");

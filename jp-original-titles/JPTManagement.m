@@ -8,13 +8,13 @@
 #import <unistd.h>
 #import <limits.h>
 
-static NSString *const kJPTCacheVersion = @"6.1.3";
+static NSString *const kJPTCacheVersion = @"6.2.1";
 static NSString *const kJPTCacheVersionKey = @"JPOriginalTitlesCacheVersion";
 static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
 static NSString *const kJPTPendingResetKey = @"JPOriginalTitlesPendingReset";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
-static NSString *const kJPTBuild = @"v6.2";
-static NSString *const kJPTBuildID = @"20261013-artist-language";
+static NSString *const kJPTBuild = @"v6.2.1";
+static NSString *const kJPTBuildID = @"20261015-complete-lookups";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
 static BOOL gJPTManagementHookInstalled;
@@ -178,9 +178,12 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
     NSMutableDictionary *pending = [[defaults dictionaryForKey:kJPTPendingResetKey] mutableCopy];
     BOOL migration = ![[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion];
     NSDictionary *last = [defaults dictionaryForKey:kJPTLastResetKey];
-    // Failed migrations wait for a user retry instead of wiping rebuilt databases on every launch.
+    // Automatic upgrades reset plugin state only; Spotify caches require an explicit selection.
     if (!pending && migration && ![last[@"migration"] isEqualToString:kJPTCacheVersion]) {
-        pending = [@{@"scope": @"metadata", @"migration": kJPTCacheVersion} mutableCopy];
+        pending = [@{@"scope": @"plugin", @"migration": kJPTCacheVersion} mutableCopy];
+    }
+    if (pending[@"migration"]) {
+        pending = [@{@"scope": @"plugin", @"migration": kJPTCacheVersion} mutableCopy];
     }
     if (!pending || [pending[@"failed"] boolValue]) return;
     NSString *scope = pending[@"scope"];
@@ -259,7 +262,7 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
     [defaults setObject:result forKey:kJPTLastResetKey];
     if (ok) {
         [defaults removeObjectForKey:kJPTPendingResetKey];
-        if ([scope isEqualToString:@"metadata"] && migration) [defaults setObject:kJPTCacheVersion forKey:kJPTCacheVersionKey];
+        if (pending[@"migration"] && migration) [defaults setObject:kJPTCacheVersion forKey:kJPTCacheVersionKey];
     } else {
         pending[@"failed"] = @YES;
         // Re-enumerate only when enumeration itself failed; otherwise retry failed targets alone.
