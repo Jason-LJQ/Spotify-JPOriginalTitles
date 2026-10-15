@@ -6,7 +6,7 @@ This repository contains prebuilt dylibs and installation instructions.
 
 | Version | Download | Features |
 | --- | --- | --- |
-| v6 — current release: v6.2 | [JPOriginalTitles.dylib](jp-original-titles/dist/v6.2/JPOriginalTitles.dylib) | Original names, artist links, search, associated-album matching and maintenance controls |
+| v6 — current release: v6.2.1 | [JPOriginalTitles.dylib](jp-original-titles/dist/v6.2.1/JPOriginalTitles.dylib) | Original names, artist links, search, associated-album matching and maintenance controls |
 | v5 | [JPOriginalTitles.dylib](jp-original-titles/dist/JPOriginalTitles.dylib) | Original names in playlists, album pages, the player bar and queue |
 
 ## Screenshots
@@ -28,8 +28,9 @@ The plugin rewrites metadata in Spotify's networking layer without changing the 
 - Looks up artist names independently. Chinese-language CJK names take priority; Japanese fallback names must contain kanji or hiragana. Pure katakana fallback names are rejected.
 - Keeps the client's artist links and applies learned names to artist entities, track contributors and search results. Playlist names remain user content.
 - Handles plain and gzip metadata requests and removes old name-query etags so refreshed metadata can be rewritten.
+- Processes large original-name lookups in batches with limited concurrency. Incomplete lookups return an error instead of a successful, partially processed response; later requests can retry.
 
-Missing or ambiguous original metadata keeps the available client value. The plugin does not guess replacements by title, change the app language or unlock region-restricted content. Korean and song-title multilingual fallback are not enabled.
+Completed lookups without an unambiguous original name keep the available client value. The plugin does not guess replacements by title, change the app language or unlock region-restricted content. Korean and song-title multilingual fallback are not enabled.
 
 ## Installation
 
@@ -39,7 +40,7 @@ Requires Spotify iOS 9.1.88 with a plugin loader that loads `Frameworks/*.dylib`
 2. Put `JPOriginalTitles.dylib` into `Payload/Spotify.app/Frameworks/` with mode 755, then repackage and install. Keep only one version of the plugin.
 3. Open **Settings and privacy → Original Titles**, directly below **Eevee Settings**.
 
-Older metadata is refreshed once when upgrading from an earlier cache revision. This automatic refresh preserves playback resume state, login, preferences, Keychain and audio files.
+Upgrades reset only the plugin name cache. Spotify metadata, playback resume state, login, preferences, Keychain and audio files are retained.
 
 All dylibs are arm64, require iOS 14.0 or later, and are ad-hoc signed.
 
@@ -55,11 +56,11 @@ Select the required reset checkboxes, then tap **Apply**. Spotify closes immedia
 | **Reset Spotify Metadata and Library Index** | Clear `PersistentCache/Users/*/primary.ldb` and the plugin name cache. The library resyncs online; playback resume state is retained. |
 | **Reset Playback Resume State** | Delete `PersistentCache/Users/*/context_player_state_restore` directly, without a backup. Clear the saved playback queue and position. |
 
-If stale restored titles remain after refreshing metadata, also select the playback resume reset. Login, preferences, Keychain and audio files are retained.
+Spotify metadata and playback resets are optional maintenance actions and run only when explicitly selected. Login, preferences, Keychain and audio files are retained.
 
 ## Limitations
 
-- Original-name lookup depends on server metadata and connectivity. Extra lookups can delay names or search results.
+- Original-name lookup depends on server metadata and connectivity. Extra lookups can delay pages or search results; interrupted lookups can cause a loading error.
 - Releases without a usable canonical or album association remain unchanged.
 - Pure-katakana Japanese artist names may remain romanized, and some other locale-dependent text may retain the client name.
 - Region-restricted original artist pages remain restricted; the plugin keeps the client's artist links.
