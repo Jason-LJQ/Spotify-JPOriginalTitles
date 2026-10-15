@@ -1543,7 +1543,8 @@ static void JPTFinishSearch(NSURLSession *session, NSURLRequest *searchRequest, 
         JPTLog(@"search %lu bytes, tracks %lu, changed %lu", (unsigned long)payload.length, (unsigned long)uris.count,
                (unsigned long)changes.count);
         for (NSString *change in changes) JPTLog(@"  %@", change);
-        deliver(patched, patched ? nil : JPTLookupError(@"Search rewrite failed"));
+        // All lookups succeeded; nil means no name needs changing, so the official payload is complete.
+        deliver(patched ?: payload, nil);
     };
     void (^onQueue)(NSError *) = ^(NSError *error) {
         void (^complete)(void) = ^{ if (error) deliver(nil, error); else finish(); };
