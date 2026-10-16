@@ -338,8 +338,8 @@ int main(void) {
         const uint8_t malformed[] = {0x12, 0x07, 0x41};
         NSData *bad = [NSData dataWithBytes:malformed length:sizeof(malformed)];
         NSData *badPayload = Response(@[Array(10, @[Entry(ownURI, bad, 200)])]);
-        Check([Rewrite(badPayload, [NSSet set], originals, [NSMutableDictionary dictionary]) isEqual:badPayload],
-              @"malformed TRACK_V4 payload is preserved without a partial rename");
+        Check(!Rewrite(badPayload, [NSSet set], originals, [NSMutableDictionary dictionary]),
+              @"malformed TRACK_V4 signals a response parse failure for delivery policy");
         NSMutableArray *invalidChanges = [NSMutableArray array];
         JPTRewriteResponse(badPayload, [NSSet set], originals, [NSMutableDictionary dictionary], invalidChanges);
         Check([[invalidChanges componentsJoinedByString:@"\n"] containsString:@"WARNING metadata entry parse failure"],

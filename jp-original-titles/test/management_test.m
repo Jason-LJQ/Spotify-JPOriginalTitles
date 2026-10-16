@@ -23,6 +23,14 @@ int main(void) {
         NSString *users = [root stringByAppendingPathComponent:@"PersistentCache/Users"];
         NSString *suite = [@"jpt.management.test." stringByAppendingString:NSUUID.UUID.UUIDString];
         NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:suite];
+        JPTLoadStrictMode(defaults);
+        Check(!JPTStrictMode(), @"strict mode defaults off");
+        JPTSetStrictMode(defaults, YES);
+        Check(JPTStrictMode() && [defaults boolForKey:kJPTStrictKey], @"strict mode changes immediately and is persisted");
+        atomic_store(&gJPTStrict, false); JPTLoadStrictMode(defaults);
+        Check(JPTStrictMode() && [JPTStrictSummary() isEqualToString:@"Strict mode: on"], @"diagnostic export summary includes persisted strict mode");
+        JPTSetStrictMode(defaults, NO);
+        Check(!JPTStrictMode() && [JPTStrictSummary() isEqualToString:@"Strict mode: off"], @"strict mode turns off immediately");
         NSFileManager *fm = [NSFileManager defaultManager];
         [fm createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:nil];
         setenv("JPT_TEST_LOG_PATH", [[root stringByAppendingPathComponent:@"JPOriginalTitles.log"] UTF8String], 1);

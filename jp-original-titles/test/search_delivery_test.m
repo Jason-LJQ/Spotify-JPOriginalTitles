@@ -93,6 +93,33 @@ int main(int argc, const char *argv[]) {
         Finish(romanized, &data, &error);
         Check(!error && [SearchName(data) isEqualToString:@"救世主"], @"missing template still applies already verified names");
 
+
+        atomic_store(&gJPTStrict, true);
+        gTemplateRequest=request;
+        gOriginalCache=[@{own:Track(@"OMGkawaiiAngel",nil)} mutableCopy];
+        Finish(english,&data,&error);
+        Check(!error && [data isEqualToData:english],@"strict OMGkawaiiAngel with no rename remains usable");
+        gOriginalCache=[@{own:Track(@"",nil)} mutableCopy];
+        Finish(english,&data,&error);
+        Check(!error && [data isEqualToData:english],@"strict completed empty-name track remains usable");
+        gOriginalCache=[NSMutableDictionary dictionary];
+        Finish(romanized,&data,&error);
+        Check(!data.length && [error.domain isEqualToString:@"JPOriginalTitles.Lookup"],@"strict exhausted search lookup blocks with zero bytes");
+        Finish(malformed,&data,&error);
+        Check(!data.length && error.code==JPTLookupParseFailure,@"strict malformed search response blocks");
+        gTemplateRequest=nil;
+        Finish(english,&data,&error);
+        Check(!error && [data isEqualToData:english],@"strict search without a template passes through");
+        gOriginalCache=[@{own:Track(@"Kyuseishu",original),original:Track(@"救世主",nil)} mutableCopy];
+        Finish(romanized,&data,&error);
+        Check(!error && [SearchName(data) isEqualToString:@"救世主"],@"strict search without template uses verified cached names");
+        NSMutableData *nested=[NSMutableData data], *entity=[NSMutableData data];
+        JPTWriteString(entity,1,own);JPTWriteString(entity,2,@"OMGkawaiiAngel");JPTWriteData(entity,5,malformed);JPTWriteData(nested,1,entity);
+        Finish(nested,&data,&error);
+        Check(!data.length && error.code==JPTLookupParseFailure,@"strict malformed structured search field blocks rather than pretending no rename");
+        atomic_store(&gJPTStrict,false);
+        Finish(nested,&data,&error);
+        Check(!error && [data isEqualToData:nested],@"default malformed structured search field preserves the original payload");
         NSData *empty = [NSData data];
         Finish(empty, &data, &error);
         Check(!error, @"search without tracks completes without an error");

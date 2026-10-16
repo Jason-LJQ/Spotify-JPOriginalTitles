@@ -937,8 +937,10 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
             uint64_t status;
             JPTField value;
             BOOL parsed = JPTParseEntry(&af, &uri, &status, &value);
-            if (status == 200 && (!parsed || (kind == kKindTrackV4 && !tracks[uri])))
+            if (status == 200 && (!parsed || !JPTIsMessage(value.data, value.len) || (kind == kKindTrackV4 && !tracks[uri]))) {
                 [changes addObject:[NSString stringWithFormat:@"WARNING metadata entry parse failure %@ kind %llu", uri, kind]];
+                return nil;
+            }
             if (kind == kKindAlbumV4 || (kind == kKindIdentityTrait && [uri hasPrefix:@"spotify:album:"])) {
                 if (kind == kKindAlbumV4 && [added containsObject:uri]) continue;
                 JPTAlbumInfo *preferred = parsed && status == 200 ? JPTPreferredAlbum(uri, metadata) : nil;
@@ -1253,37 +1255,89 @@ static NSDictionary<NSString *, JPTTrackInfo *> *JPTOriginalSnapshot(void) {
     }
 }
 
-static NSError *JPTLookupError(NSString *message) {
-    return [NSError errorWithDomain:@"JPOriginalTitles.Lookup" code:1
-        userInfo:@{NSLocalizedDescriptionKey: message}];
+static BOOL JPTStrictMode(void);
+
+typedef NS_ENUM(NSInteger, JPTLookupFailure) {
+    JPTLookupRejected = 1, JPTLookupExhausted = 2, JPTLookupParseFailure = 3
+};
+static NSString *JPTFailureName(NSError *error) {
+    return error.code == JPTLookupRejected ? @"rejected" : error.code == JPTLookupParseFailure ? @"parse-failure" : @"retry-exhausted";
+}
+static NSError *JPTLookupFailureError(JPTLookupFailure type, NSString *message) {
+    return [NSError errorWithDomain:@"JPOriginalTitles.Lookup" code:type userInfo:@{NSLocalizedDescriptionKey:message}];
 }
 
-// Bound concurrent network work without dropping any queued entities.
-static void JPTLookupRequest(NSURLRequest *request, void (^done)(NSData *, NSURLResponse *, NSError *)) {
+@interface JPTResolution : NSObject
+@property (nonatomic, strong) NSError *failure;
+@property (nonatomic) BOOL stopped;
+@end
+@implementation JPTResolution
+@end
+static char kJPTResolutionKey;
+static JPTResolution *JPTResolutionFor(NSURLRequest *request) { return objc_getAssociatedObject(request, &kJPTResolutionKey); }
+static NSURLRequest *JPTBeginResolution(NSURLRequest *request) {
+    NSURLRequest *copy = [request mutableCopy];
+    objc_setAssociatedObject(copy, &kJPTResolutionKey, [JPTResolution new], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return copy;
+}
+static NSError *JPTStopped(NSURLRequest *request) {
+    JPTResolution *state = JPTResolutionFor(request);
+    @synchronized (state) { return state.stopped ? state.failure : nil; }
+}
+static void JPTRecordFailure(NSURLRequest *request, NSError *error, BOOL terminal) {
+    if (!error) return;
+    JPTResolution *state = JPTResolutionFor(request);
+    @synchronized (state) {
+        if (!state.failure) state.failure = error;
+        if (terminal || JPTStrictMode()) { state.failure = error; state.stopped = YES; }
+    }
+}
+static NSError *JPTResolutionFailure(NSURLRequest *request) {
+    JPTResolution *state = JPTResolutionFor(request);
+    @synchronized (state) { return state.failure; }
+}
+static BOOL JPTBlockDelivery(NSError *error, NSSet *uris) {
+    if (!error) return NO;
+    BOOL strict = JPTStrictMode();
+    JPTLog(@"%@ %@: %@; URIs %@", strict ? @"strict block" : @"WARNING resolution", JPTFailureName(error), error.localizedDescription, uris.allObjects);
+    return strict;
+}
+
+// Check response cancellation again when queued work reaches the global request limit.
+static void JPTLookupRequest(NSURLRequest *request, NSURLRequest *owner, void (^done)(NSData *, NSURLResponse *, NSError *)) {
     static NSOperationQueue *queue;
     static NSURLSession *session;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        queue = [NSOperationQueue new];
-        queue.maxConcurrentOperationCount = 3;
+        queue = [NSOperationQueue new]; queue.maxConcurrentOperationCount = 3;
         NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-        config.timeoutIntervalForRequest = 8;
-        config.timeoutIntervalForResource = 20;
+#ifdef JPT_LOOKUP_TEST_PROTOCOL
+        config.protocolClasses = @[NSClassFromString(@"JPTTestTransportProtocol")];
+#endif
+#ifdef JPT_LOOKUP_TEST_TIMEOUT
+        config.timeoutIntervalForRequest = JPT_LOOKUP_TEST_TIMEOUT;
+        config.timeoutIntervalForResource = JPT_LOOKUP_TEST_TIMEOUT;
+#else
+        config.timeoutIntervalForRequest = 8; config.timeoutIntervalForResource = 20;
+#endif
         session = [NSURLSession sessionWithConfiguration:config];
     });
     [queue addOperationWithBlock:^{
+        NSError *stopped = JPTStopped(owner);
+        if (stopped) { done(nil, nil, stopped); return; }
         dispatch_semaphore_t finished = dispatch_semaphore_create(0);
         [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            done(data, response, error);
-            dispatch_semaphore_signal(finished);
+            done(data, response, error); dispatch_semaphore_signal(finished);
         }] resume];
         dispatch_semaphore_wait(finished, DISPATCH_TIME_FOREVER);
     }];
 }
 
-static NSError *JPTValidateLookup(NSData *body, NSSet *uris, NSMutableDictionary *values, BOOL artist) {
+// Completed absences are distinct from failed or missing entries.
+static NSError *JPTInspectLookup(NSData *body, NSSet *uris, NSMutableDictionary *values, BOOL artist,
+                                 NSMutableSet *retry, BOOL *whole, BOOL *terminal) {
     NSMutableSet *seen = [NSMutableSet set], *valid = [NSMutableSet set];
-    NSMutableArray *failures = [NSMutableArray array];
+    BOOL malformed = NO, entryParse = NO; NSInteger rejected = 0;
     JPTReader r = JPTReaderMake(body.bytes, body.length); JPTField f; BOOL ok;
     while (JPTNext(&r, &f, &ok)) {
         if (f.field != 2 || f.wire != 2) continue;
@@ -1294,45 +1348,139 @@ static NSError *JPTValidateLookup(NSData *body, NSSet *uris, NSMutableDictionary
             if (af.field != 3 || af.wire != 2) continue;
             NSString *uri = nil; uint64_t status = 0; JPTField value = {0};
             BOOL parsed = JPTParseEntry(&af, &uri, &status, &value);
+            if (!uri) { malformed = YES; continue; }
             if (![uris containsObject:uri]) continue;
             uint64_t expected = artist ? kKindArtistV4 : [uri hasPrefix:@"spotify:album:"] ? kKindAlbumV4 : kKindTrackV4;
             if (kind != expected) continue;
-            if ([seen containsObject:uri]) { [valid removeObject:uri]; [failures addObject:[@"duplicate " stringByAppendingString:uri]]; continue; }
+            if ([seen containsObject:uri]) { [retry addObject:uri]; [valid removeObject:uri]; continue; }
             [seen addObject:uri];
-            if (status == 204 || status == 404 || status == 410) { [values removeObjectForKey:uri]; continue; }
-            if (parsed && status == 200 && values[uri]) {
-                [valid addObject:uri];
-                if (!artist && ![values[uri] name].length) JPTLog(@"lookup completed without name %@", uri);
-            } else [failures addObject:[NSString stringWithFormat:@"entry status %llu or parse failure %@", status, uri]];
+            if (status == 429 || status == 401 || status == 403) { rejected = status; [retry addObject:uri]; continue; }
+            if (status == 204 || status == 404 || status == 410) continue;
+            if (parsed && status == 200 && values[uri]) [valid addObject:uri];
+            else { [retry addObject:uri]; if (status == 200 || !parsed) entryParse = YES; }
         }
-        if (!aok) [failures addObject:@"malformed lookup array"];
+        if (!aok) malformed = YES;
     }
-    if (!ok) [failures addObject:@"malformed lookup response"];
-    for (NSString *uri in uris) if (![seen containsObject:uri]) [failures addObject:[@"missing " stringByAppendingString:uri]];
+    if (!ok) malformed = YES;
+    for (NSString *uri in uris) if (![seen containsObject:uri]) [retry addObject:uri];
     for (NSString *uri in [values.allKeys copy]) if (![valid containsObject:uri]) [values removeObjectForKey:uri];
-    return failures.count ? JPTLookupError([failures componentsJoinedByString:@"; "]) : nil;
+    *whole = malformed; *terminal = rejected != 0;
+    if (rejected) return JPTLookupFailureError(JPTLookupRejected, [NSString stringWithFormat:@"Entry HTTP %ld", (long)rejected]);
+    if (malformed || retry.count) return JPTLookupFailureError(malformed || entryParse ? JPTLookupParseFailure : JPTLookupExhausted,
+        [NSString stringWithFormat:@"%@; URIs %@", malformed ? @"Malformed lookup response" : @"Missing, duplicate or failed entries", retry.allObjects]);
+    return nil;
+}
+static NSError *JPTValidateLookup(NSData *body, NSSet *uris, NSMutableDictionary *values, BOOL artist) {
+    BOOL whole = NO, terminal = NO;
+    return JPTInspectLookup(body, uris, values, artist, [NSMutableSet set], &whole, &terminal);
 }
 
-static void JPTFetchQueryBatch(NSURLRequest *template, NSData *body, NSSet *batch, NSString *language, BOOL artist,
-                               void (^done)(NSDictionary *, NSError *)) {
+// One wire attempt. Entry retries and split retries use this same transport and validator.
+static void JPTQueryAttempt(NSURLRequest *template, NSData *body, NSSet *batch, NSString *language, BOOL artist,
+                            void (^done)(NSDictionary *, NSSet *, NSError *, BOOL, BOOL)) {
+    NSError *stopped = JPTStopped(template);
+    if (stopped) { done(@{}, batch, stopped, NO, YES); return; }
     NSMutableURLRequest *request = [template mutableCopy];
     request.HTTPBody = JPTTrackRequest(body, batch);
     [request setValue:nil forHTTPHeaderField:@"Content-Encoding"];
     [request setValue:language forHTTPHeaderField:@"Accept-Language"];
     if ([request valueForHTTPHeaderField:@"Content-Length"])
         [request setValue:[NSString stringWithFormat:@"%lu", (unsigned long)request.HTTPBody.length] forHTTPHeaderField:@"Content-Length"];
-    JPTLookupRequest(request, ^(NSData *data, NSURLResponse *response, NSError *error) {
+    JPTLookupRequest(request, template, ^(NSData *data, NSURLResponse *response, NSError *error) {
         NSInteger code = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
-        NSMutableDictionary *values = !error && code == 200 ? [(artist ? (NSDictionary *)JPTCollectArtistNames(data) : (NSDictionary *)JPTCollectMetadata(data)) mutableCopy] : nil;
-        NSError *failure = error ?: (code != 200 || !values ? JPTLookupError(@"Lookup request failed") :
-                                    JPTValidateLookup(data, batch, values, artist));
-        JPTLog(@"lookup %@: %lu requested, %lu returned, status %ld, complete %d", language,
-            (unsigned long)batch.count, (unsigned long)values.count, (long)code, failure == nil);
-        if (failure) JPTLog(@"WARNING lookup %@ HTTP %ld: %@; URIs %@", language, (long)code, failure.localizedDescription, batch.allObjects);
-        if (!artist && values) {
-            @synchronized (gOriginalCache) { [gOriginalCache addEntriesFromDictionary:values]; }
+        BOOL terminal = code == 429 || code == 401 || code == 403 ||
+            ([error.domain isEqualToString:NSURLErrorDomain] && (error.code == NSURLErrorNotConnectedToInternet || error.code == NSURLErrorCancelled)) ||
+            [error.domain isEqualToString:@"JPOriginalTitles.Lookup"];
+        BOOL whole = error != nil || code != 200;
+        NSMutableSet *retry = [NSMutableSet set];
+        NSMutableDictionary *values = [NSMutableDictionary dictionary];
+        NSError *failure = nil;
+        if (whole) failure = [error.domain isEqualToString:@"JPOriginalTitles.Lookup"] ? error : JPTLookupFailureError(code == 429 || code == 401 || code == 403 ? JPTLookupRejected : JPTLookupExhausted,
+            [NSString stringWithFormat:@"HTTP %ld %@", (long)code, error.localizedDescription ?: @""]);
+        else {
+            // Collectors can reject a malformed entry; inspection still retains other valid entities.
+            NSDictionary *collected = artist ? (NSDictionary *)JPTCollectArtistNames(data) : (NSDictionary *)JPTCollectMetadata(data);
+            if (collected) [values addEntriesFromDictionary:collected];
+            failure = JPTInspectLookup(data, batch, values, artist, retry, &whole, &terminal);
         }
-        done(values ?: @{}, failure);
+        if (whole) [retry unionSet:batch];
+        if (terminal) { JPTLog(@"lookup no retry: %@ HTTP %ld; URIs %@", JPTFailureName(failure), (long)code, batch.allObjects); JPTRecordFailure(template, failure, YES); }
+        if (!artist && values.count) { @synchronized (gOriginalCache) { [gOriginalCache addEntriesFromDictionary:values]; } }
+        JPTLog(@"lookup %@: %lu requested, %lu returned, status %ld, complete %d", language, (unsigned long)batch.count,
+               (unsigned long)values.count, (long)code, failure == nil);
+        done(values, retry, failure, whole, terminal);
+    });
+}
+
+static void JPTResolveAttempt(NSURLRequest *, NSData *, NSSet *, NSString *, BOOL, void (^)(NSDictionary *, NSError *, BOOL));
+// A failed split level advances only if at least one child request completed successfully.
+static void JPTRetrySplit(NSURLRequest *template, NSData *body, NSArray<NSSet *> *parents, NSUInteger size,
+                           NSString *language, BOOL artist, NSString *reason, void (^done)(NSDictionary *, NSError *)) {
+    NSMutableArray *batches = [NSMutableArray array];
+    for (NSSet *parent in parents) {
+        NSArray *uris = [parent.allObjects sortedArrayUsingSelector:@selector(compare:)];
+        JPTLog(@"lookup split retry: %lu -> %lu; reason %@; URIs %@", (unsigned long)uris.count, (unsigned long)size, reason, uris);
+        for (NSUInteger offset = 0; offset < uris.count; offset += size)
+            [batches addObject:[NSSet setWithArray:[uris subarrayWithRange:NSMakeRange(offset, MIN(size, uris.count-offset))]]];
+    }
+    dispatch_group_t group = dispatch_group_create();
+    NSMutableDictionary *values = [NSMutableDictionary dictionary], *failures = [NSMutableDictionary dictionary];
+    NSMutableArray *wholeFailed = [NSMutableArray array]; __block NSUInteger succeeded = 0;
+    for (NSUInteger i = 0; i < batches.count; i++) {
+        NSSet *batch = batches[i]; NSNumber *index = @(i); dispatch_group_enter(group);
+        JPTResolveAttempt(template, body, batch, language, artist, ^(NSDictionary *got, NSError *error, BOOL whole) {
+            @synchronized (values) {
+                [values addEntriesFromDictionary:got];
+                if (whole && error) { [wholeFailed addObject:batch]; if (size == 16) JPTRecordFailure(template, error, NO); }
+                if (!error) succeeded++;
+                if (error) failures[index] = error;
+            }
+            dispatch_group_leave(group);
+        });
+    }
+    dispatch_group_notify(group, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSError *stopped = JPTStopped(template);
+        if (!stopped && succeeded && wholeFailed.count && size > 16) {
+            // Entry failures have already had their one retry; only whole-request failures split again.
+            NSMutableDictionary *entryFailures = [failures mutableCopy];
+            for (NSNumber *index in failures.allKeys) if ([wholeFailed containsObject:batches[index.unsignedIntegerValue]]) [entryFailures removeObjectForKey:index];
+            JPTRetrySplit(template, body, wholeFailed, 16, language, artist, [failures.allValues.firstObject localizedDescription], ^(NSDictionary *got, NSError *error) {
+                [values addEntriesFromDictionary:got];
+                NSNumber *first = [[entryFailures.allKeys sortedArrayUsingSelector:@selector(compare:)] firstObject];
+                done(values, first ? entryFailures[first] : error);
+            });
+        } else {
+            NSNumber *first = [[failures.allKeys sortedArrayUsingSelector:@selector(compare:)] firstObject];
+            done(values, stopped ?: (first ? failures[first] : nil));
+        }
+    });
+}
+static void JPTResolveAttempt(NSURLRequest *template, NSData *body, NSSet *batch, NSString *language, BOOL artist,
+                               void (^done)(NSDictionary *, NSError *, BOOL)) {
+    JPTQueryAttempt(template, body, batch, language, artist, ^(NSDictionary *values, NSSet *retry, NSError *error, BOOL whole, BOOL terminal) {
+        if (!error || whole || terminal) { done(values, error, whole); return; }
+        JPTLog(@"lookup entry retry: %lu entities; reason %@", (unsigned long)retry.count, error.localizedDescription);
+        JPTQueryAttempt(template, body, retry, language, artist, ^(NSDictionary *got, NSSet *failed, NSError *later, BOOL retryWhole, BOOL stop) {
+            NSMutableDictionary *merged = [values mutableCopy]; [merged addEntriesFromDictionary:got];
+            // Entry retry is never promoted into a fresh split tree.
+            if (later) JPTRecordFailure(template, later, stop);
+            done(merged, later, NO);
+        });
+    });
+}
+static void JPTFetchQueryBatch(NSURLRequest *template, NSData *body, NSSet *batch, NSString *language, BOOL artist,
+                               void (^done)(NSDictionary *, NSError *)) {
+    if (!JPTResolutionFor(template)) template = JPTBeginResolution(template);
+    JPTResolveAttempt(template, body, batch, language, artist, ^(NSDictionary *values, NSError *error, BOOL whole) {
+        void (^complete)(NSDictionary *, NSError *) = ^(NSDictionary *got, NSError *failure) {
+            NSMutableDictionary *merged = [values mutableCopy]; [merged addEntriesFromDictionary:got];
+            if (failure) { JPTRecordFailure(template, failure, NO); JPTLog(@"WARNING lookup %@: %@; URIs %@", JPTFailureName(failure), failure.localizedDescription, batch.allObjects); }
+            done(merged, failure);
+        };
+        if (error && whole && !JPTStopped(template)) {
+            JPTLog(@"lookup split reason %@", error.localizedDescription);
+            JPTRetrySplit(template, body, @[batch], 64, language, artist, error.localizedDescription, complete);
+        } else complete(@{}, error);
     });
 }
 
@@ -1341,6 +1489,8 @@ static const NSUInteger kJPTLookupBatchSize = 256;
 static void JPTFetchQueryBatches(NSURLRequest *template, NSData *body, NSArray *uris, NSUInteger offset,
                                 NSString *language, BOOL artist, NSMutableDictionary *collected,
                                 void (^done)(NSDictionary *, NSError *)) {
+    if (!JPTResolutionFor(template)) template = JPTBeginResolution(template);
+    NSError *stopped = JPTStopped(template); if (stopped) { done(collected, stopped); return; }
     if (offset == uris.count) { done(collected, nil); return; }
     NSUInteger count = MIN(kJPTLookupBatchSize, uris.count - offset);
     NSSet *batch = [NSSet setWithArray:[uris subarrayWithRange:NSMakeRange(offset, count)]];
@@ -1353,6 +1503,8 @@ static void JPTFetchQueryBatches(NSURLRequest *template, NSData *body, NSArray *
 
 // Independent batches of one album-lookup stage share the global limit of three requests.
 static void JPTFetchSiblingBatches(NSURLRequest *template, NSData *body, NSSet *wanted, void (^done)(NSError *)) {
+    if (!JPTResolutionFor(template)) template = JPTBeginResolution(template);
+    NSError *stopped = JPTStopped(template); if (stopped) { done(stopped); return; }
     NSArray *uris = [wanted.allObjects sortedArrayUsingSelector:@selector(compare:)];
     if (uris.count <= kJPTLookupBatchSize) {
         JPTFetchQueryBatches(template, body, uris, 0, kJPTOriginalLanguage, NO, [NSMutableDictionary dictionary],
@@ -1383,6 +1535,8 @@ static void JPTFetchOriginals(NSURLRequest *template, NSData *body, NSSet *uris,
 
 // Resolve one server-provided album association, then fetch only its bounded track set.
 static void JPTFetchAssociatedAlbums(NSURLRequest *template, NSData *body, NSSet<NSString *> *uris, void (^done)(NSError *)) {
+    if (!JPTResolutionFor(template)) template = JPTBeginResolution(template);
+    NSError *stopped = JPTStopped(template); if (stopped) { done(stopped); return; }
     NSDictionary *initial = JPTOriginalSnapshot();
     NSMutableSet *albums = [NSMutableSet set];
     for (NSString *uri in uris) {
@@ -1391,7 +1545,7 @@ static void JPTFetchAssociatedAlbums(NSURLRequest *template, NSData *body, NSSet
         else if (track && !JPTHasCJK(track.name) && track.isrc.length && track.albumURI) [albums addObject:track.albumURI];
     }
     if (!albums.count) { done(nil); return; }
-    void (^linkedAlbums)(NSError *) = ^(NSError *error) {
+    void (^linkedAlbums)(NSError *) = ^(NSError *sourceError) {
         NSDictionary *own = JPTOriginalSnapshot();
         NSMutableSet *linked = [NSMutableSet set];
         for (NSString *uri in albums) {
@@ -1400,7 +1554,7 @@ static void JPTFetchAssociatedAlbums(NSURLRequest *template, NSData *body, NSSet
             NSString *target = album.canonicalURI;
             if ([target hasPrefix:@"spotify:album:"] && ![target isEqualToString:uri] && !own[target]) [linked addObject:target];
         }
-        void (^albumTracks)(NSError *) = ^(NSError *error) {
+        void (^albumTracks)(NSError *) = ^(NSError *linkedError) {
             NSDictionary *snapshot = JPTOriginalSnapshot();
             NSMutableSet *missing = [NSMutableSet set];
             for (NSString *uri in albums) {
@@ -1414,10 +1568,10 @@ static void JPTFetchAssociatedAlbums(NSURLRequest *template, NSData *body, NSSet
                     JPTAlbumInfo *preferred = JPTPreferredAlbum(uri, ready);
                     if (!JPTHasCJK(preferred.name)) continue;
                     for (NSString *trackURI in preferred.trackURIs) {
-                        if (!ready[trackURI]) JPTLog(@"WARNING incomplete original album %@ missing %@", uri, trackURI);
+                        if (!ready[trackURI]) JPTLog(@"incomplete original album %@ missing %@", uri, trackURI);
                     }
                 }
-                done(nil);
+                done(sourceError ?: linkedError ?: error);
             };
             if (missing.count) JPTFetchSiblingBatches(template, body, missing, complete);
             else complete(nil);
@@ -1431,13 +1585,11 @@ static void JPTFetchAssociatedAlbums(NSURLRequest *template, NSData *body, NSSet
     else linkedAlbums(nil);
 }
 
-static const NSUInteger kJPTSiblingAlbumLimit = 32;
-
 // Field 22 contains observed performance-language codes; its schema name is inferred.
 static BOOL JPTAllowsSiblingLookup(JPTTrackInfo *track) {
     if (!track.performanceLanguages.count) return YES;
     for (NSString *language in track.performanceLanguages)
-        if ([language isEqualToString:@"ja"] || [language isEqualToString:@"und"]) return YES;
+        if ([language isEqualToString:@"ja"] || [language isEqualToString:@"und"] || [language isEqualToString:@"zxx"]) return YES;
     return NO;
 }
 static NSSet<NSString *> *JPTSiblingSourceAlbums(NSDictionary *snapshot, NSSet<NSString *> *uris) {
@@ -1449,15 +1601,13 @@ static NSSet<NSString *> *JPTSiblingSourceAlbums(NSDictionary *snapshot, NSSet<N
         if ([album isKindOfClass:[JPTAlbumInfo class]]
             && (!album.canonicalURI.length || [album.canonicalURI isEqualToString:own.albumURI])) [eligible addObject:own.albumURI];
     }
-    NSArray *ordered = [eligible.allObjects sortedArrayUsingSelector:@selector(compare:)];
-    if (ordered.count > kJPTSiblingAlbumLimit)
-        JPTLog(@"sibling album limit: %lu selected, %lu omitted for this request", (unsigned long)kJPTSiblingAlbumLimit,
-               (unsigned long)(ordered.count - kJPTSiblingAlbumLimit));
-    return [NSSet setWithArray:[ordered subarrayWithRange:NSMakeRange(0, MIN(ordered.count, kJPTSiblingAlbumLimit))]];
+    return eligible;
 }
 
 // Discover only one sibling-canonical hop; no title search or recursive album walk.
 static void JPTFetchAlbumOriginals(NSURLRequest *template, NSData *body, NSSet<NSString *> *uris, void (^done)(NSError *)) {
+    if (!JPTResolutionFor(template)) template = JPTBeginResolution(template);
+    NSError *stopped = JPTStopped(template); if (stopped) { done(stopped); return; }
     JPTFetchAssociatedAlbums(template, body, uris, ^(NSError *associationError) {
         NSDictionary *initial = JPTOriginalSnapshot();
         NSSet *sourceAlbums = JPTSiblingSourceAlbums(initial, uris);
@@ -1536,12 +1686,15 @@ static void JPTFetchArtistLanguage(NSURLRequest *template, NSData *body, NSSet *
 }
 
 static void JPTFetchArtistOriginals(NSURLRequest *template, NSData *body, NSSet *uris, void (^done)(NSError *)) {
+    if (!JPTResolutionFor(template)) template = JPTBeginResolution(template);
+    NSError *stopped = JPTStopped(template); if (stopped) { done(stopped); return; }
     NSMutableSet *missing = [NSMutableSet set];
     @synchronized (gArtistNames) {
         for (NSString *uri in uris) if (!gArtistNames[uri] && ![gArtistChecked containsObject:uri]) [missing addObject:uri];
     }
     if (!missing.count) { done(nil); return; }
     JPTFetchArtistLanguage(template, body, missing, kJPTOriginalLanguage, ^(NSDictionary *zh, NSError *zhError) {
+        if (JPTStopped(template)) { done(JPTStopped(template)); return; }
         NSMutableDictionary *preferred = [NSMutableDictionary dictionary];
         NSMutableSet *japanese = [NSMutableSet set];
         for (NSString *uri in missing) {
@@ -1712,10 +1865,36 @@ static NSURLRequest *JPTPrepareRequest(NSURLSession *session, NSURLRequest *requ
     return copy;
 }
 
+// Validate the structured search fields we actually parse; arbitrary strings stay opaque.
+static BOOL JPTSearchPayloadIsValid(NSData *payload) {
+    if (!JPTIsMessage(payload.bytes, payload.length)) return NO;
+    __block BOOL valid = YES;
+    JPTWalkSearch(payload.bytes, payload.length, 0, ^NSData *(NSString *uri, const uint8_t *p, size_t len) {
+        JPTReader r = JPTReaderMake(p, len); JPTField f; BOOL ok;
+        while (JPTNext(&r, &f, &ok)) {
+            if (f.wire != 2 || !(([uri hasPrefix:@"spotify:track:"] && f.field == 5)
+                || ([uri hasPrefix:@"spotify:album:"] && f.field == 6))) continue;
+            JPTReader ar = JPTReaderMake(f.data, f.len); JPTField af; BOOL aok;
+            while (JPTNext(&ar, &af, &aok)) {
+                if (af.wire == 2 && ((f.field == 5 && (af.field == 3 || af.field == 4)) || (f.field == 6 && af.field == 7))
+                    && !JPTIsMessage(af.data, af.len)) valid = NO;
+            }
+            if (!aok) valid = NO;
+        }
+        if (!ok) valid = NO;
+        return nil;
+    });
+    return valid;
+}
+
 // Fetches TRACK_V4 for the search tracks, then for the canonical releases of romanized ones, then rewrites
 static void JPTFinishSearch(NSURLSession *session, NSURLRequest *searchRequest, NSData *payload, void (^deliver)(NSData *, NSError *)) {
     NSSet<NSString *> *uris = JPTSearchTracks(payload);
-    if (payload.length && !JPTIsMessage(payload.bytes, payload.length)) JPTLog(@"WARNING search parse failure; no complete entity URI available");
+    if (payload.length && !JPTSearchPayloadIsValid(payload)) {
+        NSError *failure = JPTLookupFailureError(JPTLookupParseFailure, @"Search response parse failure");
+        if (JPTBlockDelivery(failure, uris)) deliver(nil, failure); else deliver(payload, nil);
+        return;
+    }
     NSOperationQueue *queue = session.delegateQueue;
     void (^finish)(void) = ^{
         NSMutableDictionary<NSString *, NSString *> *names = JPTArtistNamesSnapshot();
@@ -1738,8 +1917,10 @@ static void JPTFinishSearch(NSURLSession *session, NSURLRequest *searchRequest, 
         finish();
         return;
     }
+    template = JPTBeginResolution(template);
     void (^onQueue)(NSError *) = ^(NSError *error) {
-        void (^complete)(void) = ^{ if (error) JPTLog(@"WARNING search resolution: %@; URIs %@", error.localizedDescription, uris.allObjects); finish(); };
+        void (^complete)(void) = ^{ NSError *failure = JPTResolutionFailure(template) ?: error;
+            if (JPTBlockDelivery(failure, uris)) deliver(nil, failure); else finish(); };
         if (queue) [queue addOperationWithBlock:complete];
         else complete();
     };
@@ -1761,6 +1942,27 @@ static void JPTFinishSearch(NSURLSession *session, NSURLRequest *searchRequest, 
     }
     if (own.count) JPTFetchOriginals(template, templateBody, own, canonicals);
     else canonicals(nil);
+}
+
+static BOOL JPTClientMetadataIsValid(NSData *body) {
+    JPTReader r = JPTReaderMake(body.bytes, body.length); JPTField f; BOOL ok;
+    while (JPTNext(&r, &f, &ok)) {
+        if (f.field != 2 || f.wire != 2) continue;
+        uint64_t kind = JPTArrayKind(&f);
+        if (kind != kKindTrackV4 && kind != kKindAlbumV4 && kind != kKindArtistV4 && kind != kKindIdentityTrait && kind != kKindSimpleCard) continue;
+        JPTReader ar = JPTReaderMake(f.data, f.len); JPTField af; BOOL aok;
+        while (JPTNext(&ar, &af, &aok)) {
+            if (af.field != 3 || af.wire != 2) continue;
+            NSString *uri = nil; uint64_t status = 0; JPTField value = {0};
+            BOOL parsed = JPTParseEntry(&af, &uri, &status, &value);
+            if (status != 200) continue;
+            if (!parsed || !JPTIsMessage(value.data, value.len)) return NO;
+            if (kind == kKindTrackV4 && !JPTParseTrack(value.data, value.len)) return NO;
+            if (kind == kKindAlbumV4 && !JPTParseAlbum(value.data, value.len)) return NO;
+        }
+        if (!aok) return NO;
+    }
+    return ok;
 }
 
 static Method JPTOwnMethod(Class cls, SEL sel) {
@@ -1843,6 +2045,12 @@ static void JPTHookDelegate(NSString *name) {
             return;
         }
         NSDictionary<NSString *, JPTTrackInfo *> *tracks = JPTCollectMetadata(payload);
+        if (!tracks || !JPTClientMetadataIsValid(payload)) {
+            NSError *failure = JPTLookupFailureError(JPTLookupParseFailure, @"Metadata response parse failure");
+            if (JPTBlockDelivery(failure, state.traitTracks)) deliver(nil, failure); else deliver(payload, nil);
+            return;
+        }
+        NSURLRequest *template = JPTBeginResolution(task.currentRequest ?: task.originalRequest);
         BOOL clientOriginal = state.clientIsOriginalLanguage;
         if (clientOriginal && tracks.count) {
             @synchronized (gOriginalCache) { [gOriginalCache addEntriesFromDictionary:tracks]; }
@@ -1863,16 +2071,17 @@ static void JPTHookDelegate(NSString *name) {
                    patched ? @"" : @", parse failed");
             for (NSString *change in changes) JPTLog(@"  %@", change);
             if (!patched) JPTLog(@"WARNING metadata rewrite parse failure; URIs %@", state.traitTracks.allObjects);
-            deliver(patched ?: payload, nil);
+            NSError *failure = !patched ? JPTLookupFailureError(JPTLookupParseFailure, @"Metadata rewrite parse failure") : nil;
+            if (JPTBlockDelivery(failure, state.traitTracks)) deliver(nil, failure); else deliver(patched ?: payload, nil);
         };
         NSSet<NSString *> *missing = tracks ? JPTMissingOriginals(tracks, state.traitTracks, originals(), !clientOriginal) : nil;
         // Deliver later on the delegate queue once original-name metadata is fetched
         NSOperationQueue *queue = session.delegateQueue;
         void (^onQueue)(NSError *) = ^(NSError *error) {
-            void (^complete)(void) = ^{ if (error) JPTLog(@"WARNING metadata resolution: %@; URIs %@", error.localizedDescription, state.traitTracks.allObjects); finish(); };
+            void (^complete)(void) = ^{ NSError *failure = JPTResolutionFailure(template) ?: error;
+                if (JPTBlockDelivery(failure, state.traitTracks)) deliver(nil, failure); else finish(); };
             if (queue) [queue addOperationWithBlock:complete]; else complete();
         };
-        NSURLRequest *template = task.currentRequest ?: task.originalRequest;
         void (^resolveArtists)(NSError *) = ^(NSError *error) {
             NSMutableSet *artists = [state.artistURIs mutableCopy] ?: [NSMutableSet set];
             [artists unionSet:JPTResolutionArtists(originals(), state.traitTracks)];

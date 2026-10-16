@@ -13,10 +13,18 @@ static NSString *const kJPTCacheVersionKey = @"JPOriginalTitlesCacheVersion";
 static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
 static NSString *const kJPTPendingResetKey = @"JPOriginalTitlesPendingReset";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
-static NSString *const kJPTBuild = @"v6.3.1";
-static NSString *const kJPTBuildID = @"20261016-stage-batches";
+static NSString *const kJPTBuild = @"v6.3.2";
+static NSString *const kJPTBuildID = @"20261016-typed-retry-strict";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
+static atomic_bool gJPTStrict;
+static NSString *const kJPTStrictKey = @"JPOriginalTitlesStrictMode";
+static BOOL JPTStrictMode(void) { return atomic_load(&gJPTStrict); }
+static void JPTLoadStrictMode(NSUserDefaults *defaults) { atomic_store(&gJPTStrict, [defaults boolForKey:kJPTStrictKey]); }
+static void JPTSetStrictMode(NSUserDefaults *defaults, BOOL enabled) {
+    [defaults setBool:enabled forKey:kJPTStrictKey]; [defaults synchronize]; atomic_store(&gJPTStrict, enabled);
+}
+static NSString *JPTStrictSummary(void) { return [NSString stringWithFormat:@"Strict mode: %@", JPTStrictMode() ? @"on" : @"off"]; }
 static BOOL gJPTManagementHookInstalled;
 
 static dispatch_queue_t JPTLogQueue(void) {
@@ -125,6 +133,7 @@ static NSString *JPTDiagnosticSummary(void) {
         BOOL found = JPTDelegateHooked(name);
         [lines addObject:[NSString stringWithFormat:@"Delegate %@: %@", name, found ? @"hooked" : @"unavailable"]];
     }
+    [lines addObject:JPTStrictSummary()];
     [lines addObject:[NSString stringWithFormat:@"Logging: %@", atomic_load(&gJPTLogging) ? @"on" : @"off"]];
     [lines addObject:[NSString stringWithFormat:@"Original cache: %lu; artist names: %lu", (unsigned long)JPTOriginalSnapshot().count,
                       (unsigned long)JPTArtistNamesSnapshot().count]];
@@ -309,7 +318,7 @@ static BOOL JPTSavePendingReset(NSUserDefaults *defaults, NSString *scope, BOOL 
     [self.tableView reloadData];
 }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return section == 0 ? 4 : section == 1 ? 3 : 6; }
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return section == 0 ? 4 : section == 1 ? 4 : 6; }
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section { return @[@"Status", @"Diagnostics", @"Reset Options"][section]; }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 1) return @"Logging is off by default. Logs may include track names and URIs. No authentication tokens or full responses are recorded. Two log files are retained, up to 1 MB each.";
@@ -338,11 +347,16 @@ static BOOL JPTSavePendingReset(NSUserDefaults *defaults, NSString *scope, BOOL 
         if (index.row == 2) cell.detailTextLabel.text = [NSString stringWithFormat:@"Original tracks %lu · Artist names %lu", (unsigned long)JPTOriginalSnapshot().count, (unsigned long)JPTArtistNamesSnapshot().count];
         if (index.row == 3) cell.detailTextLabel.text = JPTResetSummary();
     } else if (index.section == 1) {
-        cell.textLabel.text = @[@"Diagnostic Logging", @"Export Diagnostics", @"Clear Logs"][index.row];
+        cell.textLabel.text = @[@"Diagnostic Logging", @"Strict Mode", @"Export Diagnostics", @"Clear Logs"][index.row];
         if (index.row == 0) {
             cell.accessibilityIdentifier = @"jpt.logging";
             UISwitch *toggle = [UISwitch new]; toggle.on = atomic_load(&gJPTLogging); toggle.accessibilityIdentifier = @"jpt.logging";
             [toggle addTarget:self action:@selector(loggingChanged:) forControlEvents:UIControlEventValueChanged]; cell.accessoryView = toggle;
+        } else if (index.row == 1) {
+            cell.detailTextLabel.text = @"Fail the request when an original-name lookup fails instead of delivering names without enhancement. Pages may fail to load.";
+            cell.accessibilityIdentifier = @"jpt.strict";
+            UISwitch *toggle = [UISwitch new]; toggle.on = JPTStrictMode(); toggle.accessibilityIdentifier = @"jpt.strict";
+            [toggle addTarget:self action:@selector(strictChanged:) forControlEvents:UIControlEventValueChanged]; cell.accessoryView = toggle;
         } else cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     } else {
         cell.textLabel.text = @[@"Reset Plugin Name Cache", @"Reset Spotify Metadata and Library Index", @"Reset Playback Resume State", @"Retry Failed Reset", @"Pending Reset", @"Cancel Pending Reset"][index.row];
@@ -379,6 +393,7 @@ static BOOL JPTSavePendingReset(NSUserDefaults *defaults, NSString *scope, BOOL 
     [[NSUserDefaults standardUserDefaults] synchronize]; atomic_store(&gJPTLogging, toggle.on);
     if (toggle.on) JPTLog(@"diagnostics enabled\n%@", JPTDiagnosticSummary());
 }
+- (void)strictChanged:(UISwitch *)toggle { JPTSetStrictMode([NSUserDefaults standardUserDefaults], toggle.on); }
 - (void)apply {
     if (!self.resetPlugin && !self.resetMetadata && !self.resetPlayback && !self.retryFailed) return;
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
@@ -419,8 +434,8 @@ static BOOL JPTSavePendingReset(NSUserDefaults *defaults, NSString *scope, BOOL 
     [tableView deselectRowAtIndexPath:index animated:YES];
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSDictionary *pending = [defaults dictionaryForKey:kJPTPendingResetKey];
-    if (index.section == 1 && index.row == 1) [self exportFrom:[tableView cellForRowAtIndexPath:index]];
-    if (index.section == 1 && index.row == 2) {
+    if (index.section == 1 && index.row == 2) [self exportFrom:[tableView cellForRowAtIndexPath:index]];
+    if (index.section == 1 && index.row == 3) {
         dispatch_async(JPTLogQueue(), ^{
             [[NSFileManager defaultManager] removeItemAtPath:JPTLogPath() error:nil];
             [[NSFileManager defaultManager] removeItemAtPath:[JPTLogPath() stringByAppendingString:@".1"] error:nil];
@@ -545,6 +560,7 @@ static void JPTInstallManagementHook(void) {
 __attribute__((constructor)) static void JPTInit(void) {
     @autoreleasepool {
         atomic_store(&gJPTLogging, [[NSUserDefaults standardUserDefaults] boolForKey:kJPTLoggingKey]);
+        JPTLoadStrictMode([NSUserDefaults standardUserDefaults]);
         JPTProcessReset(JPTUsersPath(), [NSUserDefaults standardUserDefaults]);
         JPTInitializeNetwork(); JPTInstallManagementHook();
     }
