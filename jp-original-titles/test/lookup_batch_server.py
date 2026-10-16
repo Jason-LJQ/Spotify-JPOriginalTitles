@@ -56,7 +56,7 @@ class Handler(BaseHTTPRequestHandler):
             for field, query in parts:
                 if field == 2:
                     queries.append((dict(fields(query))[1], uri))
-        client = any(kind == 178 for kind, _ in queries)
+        client = any(kind == 178 for kind, _ in queries) or self.headers.get('Accept-Language') == 'en-US'
         with lock:
             mode = self.path.removesuffix('/extended-metadata/v0/extended-metadata')
             if mode != '/timeout':
@@ -77,6 +77,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif mode in ['/first-500', '/client-first-500'] and attempt == 1:
                     status = 500
                 elif mode == '/over-64' and len(queries) > 64:
+                    status = 500
+                elif mode == '/mixed-split' and (len(queries) > 64 or any(uri.endswith('0000000000000000000001') for _, uri in queries)):
                     status = 500
                 elif mode == '/poison' and any(uri.endswith('0000000000000000000001') for _, uri in queries):
                     status = 500
@@ -124,6 +126,14 @@ class Handler(BaseHTTPRequestHandler):
                         status = 404
                 if client and mode == '/client-nested-malformed' and kind == 10:
                     payload = b'\xff'
+                if mode.startswith(('/empty-name-', '/empty-artist-resolve', '/client-original-empty-')):
+                    payload = ld(2, b'')
+                if mode.startswith('/absent-name-'):
+                    payload = b''
+                if mode == '/mixed-split' and int(uri.rsplit(':',1)[-1]) in [64,128,192]:
+                    status = 500
+                if mode == '/client-mixed-bad' and uri == 'spotify:track:8888888888888888888888':
+                    payload = b'\xff'
                 entry = ld(1, vi(1, status)) + ld(2, uri.encode()) + ld(3, ld(2, payload))
                 groups[kind].append(ld(3, entry))
                 if mode == '/duplicate-once' and attempt == 1 and (kind, uri) == queries[0]:
@@ -164,7 +174,7 @@ if binary.stem == 'retry_policy_test':
                 '/first-500': [256,64,64,64,64], '/http-failure': [256,64,64,64,64],
                 '/timeout': [256,64,64,64,64], '/strict-exhausted': [256,64,64,64,64], '/malformed': [256,64,64,64,64],
                 '/missing-once': [256,1], '/entry-once': [256,1], '/entry-parse-once': [256,1], '/duplicate-once': [256,1],
-                '/429': [256], '/401': [256], '/403': [256]}
+                '/mixed-split': [256,64,64,64,64,1,1,1,16,16,16,16], '/429': [256], '/401': [256], '/403': [256]}
     for path, wanted in expected.items():
         assert sizes(path) == sorted(wanted), (path, sizes(path), wanted)
         print('PASS request sizes', path, sizes(path))
@@ -174,10 +184,21 @@ if binary.stem == 'retry_policy_test':
         print('PASS immediate client stop', code, 'one lookup per strict mode setting')
     print('PASS retry request accounting; timeout server handlers excluded from live-transport concurrency')
 
-    for mode in ['original-503','original-empty','nested-malformed']:
+    for mode in ['original-503','original-empty']:
         lookups=[r for r in records if r['path']==f'/client-{mode}/extended-metadata/v0/extended-metadata' and not r['client']]
         assert not lookups, (mode, lookups)
         print('PASS original response bypass/preflight',mode)
     absent=[r for r in records if r['path']=='/client-album-404/extended-metadata/v0/extended-metadata' and not r['client']]
     assert any(r['kinds']==[9] for r in absent) and any(r['kinds']==[10] for r in absent)
     print('PASS complete album absence exercised through real stage requests')
+
+    for name in ['empty-name','absent-name']:
+        for kind in ['album','artist']:
+            for strict in [0,1]:
+                assert sizes(f'/{name}-{kind}-{strict}') == [1], (name, kind, strict)
+    assert sizes('/empty-artist-resolve') == [1]
+    assert [r['language'] for r in records if r['path']=='/empty-artist-resolve'] == ['zh-Hans']
+    print('PASS completed empty album/artist requests never retry or trigger Japanese fallback')
+    mixed=[r for r in records if r['path']=='/client-mixed-bad/extended-metadata/v0/extended-metadata']
+    assert sum(r['client'] for r in mixed)==2 and any(not r['client'] for r in mixed)
+    print('PASS mixed default response continues enrichment while strict response blocks')

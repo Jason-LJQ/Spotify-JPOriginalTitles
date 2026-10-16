@@ -6,7 +6,7 @@ This repository contains prebuilt dylibs and installation instructions.
 
 | Version | Download | Features |
 | --- | --- | --- |
-| v6 — current release: v6.2.1 | [JPOriginalTitles.dylib](jp-original-titles/dist/v6.2.1/JPOriginalTitles.dylib) | Original names, artist links, search, associated-album matching and maintenance controls |
+| v6 — current release: v6.3.3 | [JPOriginalTitles.dylib](jp-original-titles/dist/v6.3.3/JPOriginalTitles.dylib) | Original names, artist links, search, associated-album matching and maintenance controls |
 | v5 | [JPOriginalTitles.dylib](jp-original-titles/dist/JPOriginalTitles.dylib) | Original names in playlists, album pages, the player bar and queue |
 
 ## Screenshots
@@ -24,11 +24,11 @@ Artist page:
 The plugin rewrites metadata in Spotify's networking layer without changing the Spotify main binary.
 
 - Restores track, album and artist names in IdentityTrait and client-requested TRACK_V4 metadata, including structured title fields.
-- Uses a track's canonical release when it supplies an original CJK name. Otherwise, it can follow a server-provided album association and match a unique ISRC with identical duration, disc and track number.
+- Uses a track's canonical release when it supplies an original CJK name. Otherwise, it can follow a server-provided album association, an observed reverse canonical link or a sibling track’s canonical release. Indirect track matches require a unique ISRC with identical duration, disc and track number; reverse and sibling matches also require a canonical link back to the requested track. Sibling-release discovery runs only when the observed performance language is Japanese, undetermined, non-linguistic, or absent.
 - Looks up artist names independently. Chinese-language CJK names take priority; Japanese fallback names must contain kanji or hiragana. Pure katakana fallback names are rejected.
-- Keeps the client's artist links and applies learned names to artist entities, track contributors and search results. Playlist names remain user content.
+- Resolves names on original-release artist entities before retaining the client's artist links, and applies learned names to artist entities, track contributors and search results. Playlist names remain user content.
 - Handles plain and gzip metadata requests and removes old name-query etags so refreshed metadata can be rewritten.
-- Processes large original-name lookups in batches with limited concurrency. Incomplete lookups return an error instead of a successful, partially processed response; later requests can retry.
+- Processes large original-name lookups in batches with limited concurrency. Request failures can retry in smaller batches, and incomplete responses retry only the affected entities. By default, verified changes are retained, while unresolved names and unparseable entries keep Spotify’s values. Failed items remain retryable; diagnostics record warnings when enabled.
 
 Completed lookups without an unambiguous original name keep the available client value. The plugin does not guess replacements by title, change the app language or unlock region-restricted content. Korean and song-title multilingual fallback are not enabled.
 
@@ -40,13 +40,15 @@ Requires Spotify iOS 9.1.88 with a plugin loader that loads `Frameworks/*.dylib`
 2. Put `JPOriginalTitles.dylib` into `Payload/Spotify.app/Frameworks/` with mode 755, then repackage and install. Keep only one version of the plugin.
 3. Open **Settings and privacy → Original Titles**, directly below **Eevee Settings**.
 
-Upgrades reset only the plugin name cache. Spotify metadata, playback resume state, login, preferences, Keychain and audio files are retained.
+Plugin cache migrations reset only the plugin name cache; upgrades with the same cache revision retain it. Spotify metadata, playback resume state, login, preferences, Keychain and audio files are retained.
 
 All dylibs are arm64, require iOS 14.0 or later, and are ad-hoc signed.
 
 ## Maintenance
 
-The English management page includes versions, hook status, cache counts, diagnostic logging, log export and log clearing.
+The English management page includes versions, hook status, cache counts, diagnostic logging, strict mode, log export and log clearing.
+
+**Strict Mode** is off by default and takes effect immediately. When enabled, a failed original-name lookup or an unparseable client response fails the request instead of delivering names without enhancement. This can cause pages or search results to fail to load. Search can still use cached names before a metadata request template is available.
 
 Select the required reset checkboxes, then tap **Apply**. Spotify closes immediately; reopen it to run the selected resets.
 
@@ -60,8 +62,8 @@ Spotify metadata and playback resets are optional maintenance actions and run on
 
 ## Limitations
 
-- Original-name lookup depends on server metadata and connectivity. Extra lookups can delay pages or search results; interrupted lookups can cause a loading error.
-- Releases without a usable canonical or album association remain unchanged.
+- Original-name lookup depends on server metadata and connectivity. Extra lookups can delay pages or search results. Unresolved names delivered after a failed lookup can remain in Spotify’s metadata cache until it refreshes. Strict mode does not repair already cached names; use the metadata reset option to fetch them again.
+- Releases without a usable canonical link or unambiguous album match remain unchanged.
 - Pure-katakana Japanese artist names may remain romanized, and some other locale-dependent text may retain the client name.
 - Region-restricted original artist pages remain restricted; the plugin keeps the client's artist links.
 - Spotify updates can change the internal classes and protocol fields used by the plugin.

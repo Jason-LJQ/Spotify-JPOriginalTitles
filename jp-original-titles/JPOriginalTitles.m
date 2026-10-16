@@ -209,7 +209,7 @@ static JPTAlbumInfo *JPTParseAlbum(const uint8_t *p, size_t len) {
         }
     }
     info.trackURIs = tracks;
-    return ok && info.name.length ? info : nil;
+    return ok ? info : nil;
 }
 
 // Track: 2 name, 3 album, 4 artists, 27 original_title, 28 version_title, 36 canonical_uri
@@ -633,7 +633,7 @@ static NSDictionary<NSString *, NSString *> *JPTCollectArtistNames(NSData *body)
             NSString *uri = nil, *name = nil, *gidURI = nil; uint64_t status; JPTField value;
             if (!JPTParseEntry(&af, &uri, &status, &value) || status != 200
                 || ![uri hasPrefix:@"spotify:artist:"]) continue;
-            if (JPTParseEntity(value.data, value.len, &name, &gidURI, @"spotify:artist:") && name.length) names[uri] = name;
+            if (JPTParseEntity(value.data, value.len, &name, &gidURI, @"spotify:artist:")) names[uri] = name ?: @"";
         }
         if (!aok) return nil;
     }
@@ -937,13 +937,17 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
             uint64_t status;
             JPTField value;
             BOOL parsed = JPTParseEntry(&af, &uri, &status, &value);
+            // Helper entries are not part of the client's response, including failed helpers.
+            if ((kind == kKindTrackV4 || kind == kKindAlbumV4) && uri && [added containsObject:uri]) continue;
             if (status == 200 && (!parsed || !JPTIsMessage(value.data, value.len) || (kind == kKindTrackV4 && !tracks[uri]))) {
                 [changes addObject:[NSString stringWithFormat:@"WARNING metadata entry parse failure %@ kind %llu", uri, kind]];
-                return nil;
+                JPTWriteRaw(array, &af); kept++;
+                continue;
             }
             if (kind == kKindAlbumV4 || (kind == kKindIdentityTrait && [uri hasPrefix:@"spotify:album:"])) {
                 if (kind == kKindAlbumV4 && [added containsObject:uri]) continue;
                 JPTAlbumInfo *preferred = parsed && status == 200 ? JPTPreferredAlbum(uri, metadata) : nil;
+                if (!preferred.name.length) preferred = nil;
                 NSString *oldName = nil;
                 NSData *renamed = preferred ? JPTReplaceString(value.data, value.len, 2, preferred.name, &oldName) : nil;
                 if (renamed && kind == kKindAlbumV4 && preferred.originalTitle.length)
@@ -1413,7 +1417,7 @@ static void JPTQueryAttempt(NSURLRequest *template, NSData *body, NSSet *batch, 
 }
 
 static void JPTResolveAttempt(NSURLRequest *, NSData *, NSSet *, NSString *, BOOL, void (^)(NSDictionary *, NSError *, BOOL));
-// A failed split level advances only if at least one child request completed successfully.
+// Entry-level failures do not turn a received response into a whole-request failure.
 static void JPTRetrySplit(NSURLRequest *template, NSData *body, NSArray<NSSet *> *parents, NSUInteger size,
                            NSString *language, BOOL artist, NSString *reason, void (^done)(NSDictionary *, NSError *)) {
     NSMutableArray *batches = [NSMutableArray array];
@@ -1432,7 +1436,7 @@ static void JPTRetrySplit(NSURLRequest *template, NSData *body, NSArray<NSSet *>
             @synchronized (values) {
                 [values addEntriesFromDictionary:got];
                 if (whole && error) { [wholeFailed addObject:batch]; if (size == 16) JPTRecordFailure(template, error, NO); }
-                if (!error) succeeded++;
+                if (!whole) succeeded++;
                 if (error) failures[index] = error;
             }
             dispatch_group_leave(group);
@@ -1699,7 +1703,7 @@ static void JPTFetchArtistOriginals(NSURLRequest *template, NSData *body, NSSet 
         NSMutableSet *japanese = [NSMutableSet set];
         for (NSString *uri in missing) {
             if (JPTHasCJK(zh[uri])) preferred[uri] = zh[uri];
-            else if (zh[uri]) [japanese addObject:uri];
+            else if ([zh[uri] length]) [japanese addObject:uri];
         }
         JPTMergeArtistNames(preferred);
         if (!japanese.count) { done(zhError); return; }
@@ -2047,8 +2051,8 @@ static void JPTHookDelegate(NSString *name) {
         NSDictionary<NSString *, JPTTrackInfo *> *tracks = JPTCollectMetadata(payload);
         if (!tracks || !JPTClientMetadataIsValid(payload)) {
             NSError *failure = JPTLookupFailureError(JPTLookupParseFailure, @"Metadata response parse failure");
-            if (JPTBlockDelivery(failure, state.traitTracks)) deliver(nil, failure); else deliver(payload, nil);
-            return;
+            if (JPTBlockDelivery(failure, state.traitTracks)) { deliver(nil, failure); return; }
+            if (!tracks) { deliver(payload, nil); return; }
         }
         NSURLRequest *template = JPTBeginResolution(task.currentRequest ?: task.originalRequest);
         BOOL clientOriginal = state.clientIsOriginalLanguage;
@@ -2071,7 +2075,8 @@ static void JPTHookDelegate(NSString *name) {
                    patched ? @"" : @", parse failed");
             for (NSString *change in changes) JPTLog(@"  %@", change);
             if (!patched) JPTLog(@"WARNING metadata rewrite parse failure; URIs %@", state.traitTracks.allObjects);
-            NSError *failure = !patched ? JPTLookupFailureError(JPTLookupParseFailure, @"Metadata rewrite parse failure") : nil;
+            NSError *failure = !patched || (JPTStrictMode() && !JPTClientMetadataIsValid(payload))
+                ? JPTLookupFailureError(JPTLookupParseFailure, @"Metadata rewrite parse failure") : nil;
             if (JPTBlockDelivery(failure, state.traitTracks)) deliver(nil, failure); else deliver(patched ?: payload, nil);
         };
         NSSet<NSString *> *missing = tracks ? JPTMissingOriginals(tracks, state.traitTracks, originals(), !clientOriginal) : nil;

@@ -338,8 +338,21 @@ int main(void) {
         const uint8_t malformed[] = {0x12, 0x07, 0x41};
         NSData *bad = [NSData dataWithBytes:malformed length:sizeof(malformed)];
         NSData *badPayload = Response(@[Array(10, @[Entry(ownURI, bad, 200)])]);
-        Check(!Rewrite(badPayload, [NSSet set], originals, [NSMutableDictionary dictionary]),
-              @"malformed TRACK_V4 signals a response parse failure for delivery policy");
+        Check([Rewrite(badPayload, [NSSet set], originals, [NSMutableDictionary dictionary]) isEqualToData:badPayload],
+              @"default rewrite preserves an isolated malformed TRACK_V4 entry");
+        NSString *badURI=URI(@"track",50), *helperURI=URI(@"track",60), *helperAlbum=URI(@"album",70);
+        NSData *mixedBad=Response(@[Array(10,@[Entry(badURI,bad,200),Entry(ownURI,ownTrack,200),Entry(helperURI,bad,200)]),
+                                   Array(9,@[Entry(helperAlbum,[NSData data],200)])]);
+        NSData *mixedOut=Rewrite(mixedBad,[NSSet setWithArray:@[helperURI,helperAlbum]],originals,[NSMutableDictionary dictionary]);
+        Check([String(Payload(mixedOut,10,ownURI),2) isEqualToString:@"ray - 超かぐや姫！Version"],@"default mixed response retains the verified rename beside a malformed entry");
+        Check([Payload(mixedOut,10,badURI) isEqualToData:bad],@"default mixed response preserves malformed client bytes");
+        Check(!Payload(mixedOut,10,helperURI) && !Payload(mixedOut,9,helperAlbum),@"default mixed response strips malformed track and empty album helpers");
+        NSData *emptyAlbumResponse=Response(@[Array(9,@[Entry(helperAlbum,[NSData data],200)]),
+                                             Array(178,@[Entry(helperAlbum,Entity(70,@"Official album title"),200)])]);
+        NSData *emptyAlbumOut=Rewrite(emptyAlbumResponse,[NSSet setWithObject:helperAlbum],@{},[NSMutableDictionary dictionary]);
+        Check([String(Payload(emptyAlbumOut,178,helperAlbum),2) isEqualToString:@"Official album title"],@"completed empty album helper cannot erase the official IdentityTrait name");
+        NSData *emptyAlbumOnly=Response(@[Array(9,@[Entry(helperAlbum,[NSData data],200)])]);
+        Check([Rewrite(emptyAlbumOnly,[NSSet set],@{},[NSMutableDictionary dictionary]) isEqualToData:emptyAlbumOnly],@"completed empty client album stays byte-for-byte unchanged");
         NSMutableArray *invalidChanges = [NSMutableArray array];
         JPTRewriteResponse(badPayload, [NSSet set], originals, [NSMutableDictionary dictionary], invalidChanges);
         Check([[invalidChanges componentsJoinedByString:@"\n"] containsString:@"WARNING metadata entry parse failure"],
