@@ -8,13 +8,13 @@
 #import <unistd.h>
 #import <limits.h>
 
-static NSString *const kJPTCacheVersion = @"6.2.1";
+static NSString *const kJPTCacheVersion = @"6.3";
 static NSString *const kJPTCacheVersionKey = @"JPOriginalTitlesCacheVersion";
 static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
 static NSString *const kJPTPendingResetKey = @"JPOriginalTitlesPendingReset";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
-static NSString *const kJPTBuild = @"v6.2.2";
-static NSString *const kJPTBuildID = @"20261015-search-unchanged";
+static NSString *const kJPTBuild = @"v6.3";
+static NSString *const kJPTBuildID = @"20261015-reverse-originals";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
 static BOOL gJPTManagementHookInstalled;

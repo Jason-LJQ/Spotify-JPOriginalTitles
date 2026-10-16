@@ -46,7 +46,7 @@ int main(int argc,const char *argv[]) {
         Check(tracks.count==300,@"load the real 300-track cold batch");
         NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:[base stringByAppendingString:@"/good"]]];request.HTTPMethod=@"POST";
         gOriginalCache=[tracks mutableCopy];gArtistNames=[NSMutableDictionary dictionary];gArtistChecked=[NSMutableSet set];
-        Await(^(void (^done)(NSError *)){JPTFetchAlbumOriginals(request,body,[NSSet setWithArray:tracks.allKeys],done);},YES,@"193 albums resolve instead of being skipped");
+        Await(^(void (^done)(NSError *)){JPTFetchAlbumOriginals(request,body,[NSSet setWithArray:tracks.allKeys],done);},YES,@"a real large album set resolves instead of being skipped");
         NSData *rewritten=JPTRewriteResponse(raw,[NSSet set],JPTOriginalSnapshot(),[NSMutableDictionary dictionary],[NSMutableArray array]);
         Check([[JPTCollectTracks(rewritten)[target] name] isEqualToString:@"救世主"],@"cold large batch delivers the original name without prewarming");
         gOriginalCache=[NSMutableDictionary dictionary];
@@ -61,12 +61,20 @@ int main(int argc,const char *argv[]) {
             Await(^(void (^done)(NSError *)){JPTFetchOriginals(request,body,[NSSet setWithObject:target],done);},NO,[NSString stringWithFormat:@"%@ propagates failure",mode]);
             Check(!gOriginalCache[target],@"failed lookup does not create a successful cache value");
         }
+        NSArray *pair=[[tracks allKeys] sortedArrayUsingSelector:@selector(compare:)];
+        NSString *kept=pair[0],*omitted=pair[1];gOriginalCache=[NSMutableDictionary dictionary];
+        request.URL=[NSURL URLWithString:[base stringByAppendingString:@"/partial"]];
+        Await(^(void (^done)(NSError *)){JPTFetchOriginals(request,body,[NSSet setWithArray:@[kept,omitted]],done);},NO,@"mixed response reports its missing entry");
+        Check(gOriginalCache[kept]!=nil && !gOriginalCache[omitted],@"same failed batch caches only its individually valid entry");
+        request.URL=[NSURL URLWithString:[base stringByAppendingString:@"/good"]];
+        Await(^(void (^done)(NSError *)){JPTFetchOriginals(request,body,[NSSet setWithObject:omitted],done);},YES,@"missing entry retries through the real asynchronous lookup");
+        Check(gOriginalCache[omitted]!=nil,@"retry caches the previously missing entry");
         request.URL=[NSURL URLWithString:[base stringByAppendingString:@"/good"]];
         Await(^(void (^done)(NSError *)){JPTFetchOriginals(request,body,[NSSet setWithObject:target],done);},YES,@"a later request retries successfully after failure");
         Check(gOriginalCache[target]!=nil,@"successful retry supplies metadata");
         gDelegateClasses=[NSMutableArray array];JPTHookDelegate(@"JPTBatchDelegate");gOriginalCache=[NSMutableDictionary dictionary];
         ClientRequest([base stringByAppendingString:@"/client-failure"],target);
-        Check(deliveryError!=nil && received.length==0,@"failed enrichment reaches Spotify as an error with no successful body");
+        Check(!deliveryError && received.length>0,@"failed enrichment delivers official data without a lookup error");
         gArtistNames=[@{@"spotify:artist:2mcj8ajoE1eFlNkAihw5Cg":@"月詠み"} mutableCopy];
         ClientRequest([base stringByAppendingString:@"/good"],target);
         Check(!deliveryError && received.length>0,@"retry delivers a complete successful body");

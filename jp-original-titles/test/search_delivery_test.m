@@ -1,4 +1,4 @@
-// Search delivery: unchanged results stay usable, failed lookups still reach Spotify as errors.
+// Search delivery: unchanged results stay usable, failed lookups retain usable official data.
 #define JPT_MANAGEMENT_TEST 1
 #include "../JPOriginalTitles.m"
 static NSUInteger checks;
@@ -56,15 +56,42 @@ int main(int argc, const char *argv[]) {
         Finish(romanized, &data, &error);
         Check(!error && [SearchName(data) isEqualToString:@"救世主"], @"a verified original name is still delivered");
 
+        NSString *logPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"jpt-warning-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+        setenv("JPT_TEST_LOG_PATH", logPath.UTF8String, 1); atomic_store(&gJPTLogging, true);
         gOriginalCache = [NSMutableDictionary dictionary];
         Finish(romanized, &data, &error);
-        Check(error != nil && data.length == 0, @"a failed lookup still reaches Spotify as an error with no body");
+        dispatch_sync(JPTLogQueue(), ^{});
+        NSString *warning = [NSString stringWithContentsOfFile:logPath encoding:NSUTF8StringEncoding error:nil];
+        Check([warning containsString:@"WARNING lookup"] && [warning containsString:own], @"diagnostics identify failed lookup and relevant URI");
+        atomic_store(&gJPTLogging, false);
+        NSData *logged = [NSData dataWithContentsOfFile:logPath];
+        Finish(romanized, &data, &error); dispatch_sync(JPTLogQueue(), ^{});
+        Check([logged isEqualToData:[NSData dataWithContentsOfFile:logPath]], @"disabled diagnostics write no warnings");
+        [[NSFileManager defaultManager] removeItemAtPath:logPath error:nil];
+        Check(!error && [data isEqualToData:romanized], @"a failed lookup delivers official data without an error");
         Check(!gOriginalCache[own], @"a failed lookup does not create a cache value");
+
+        NSMutableData *partial = [Search(original, @"Official unknown") mutableCopy];
+        [partial appendData:Search(own, @"Kyuseishu")];
+        NSString *jp = @"spotify:track:0000000000000000000003";
+        gOriginalCache = [@{own: Track(@"Kyuseishu", jp), jp: Track(@"救世主", nil)} mutableCopy];
+        Finish(partial, &data, &error);
+        Check(!error && [JPTSearchTracks(data) isEqualToSet:JPTSearchTracks(partial)], @"partial failure retains every official search entity");
+        Check([data rangeOfData:[@"救世主" dataUsingEncoding:NSUTF8StringEncoding] options:0 range:NSMakeRange(0,data.length)].location != NSNotFound,
+              @"partial failure still applies the verified original name");
+        Check(!gOriginalCache[original], @"the failed entity remains retryable");
+        const uint8_t invalid[] = {0xff}; NSData *malformed = [NSData dataWithBytes:invalid length:1];
+        Finish(malformed, &data, &error);
+        Check(!error && [data isEqualToData:malformed], @"unparseable search payload is delivered unchanged");
 
         gTemplateRequest = nil;
         gOriginalCache = [@{own: Track(@"OMGkawaiiAngel", nil)} mutableCopy];
         Finish(english, &data, &error);
-        Check(error != nil && data.length == 0, @"search without a lookup template still fails");
+        Check(!error && [data isEqualToData:english], @"search without a lookup template delivers official data");
+
+        gOriginalCache = [@{own: Track(@"Kyuseishu", original), original: Track(@"救世主", nil)} mutableCopy];
+        Finish(romanized, &data, &error);
+        Check(!error && [SearchName(data) isEqualToString:@"救世主"], @"missing template still applies already verified names");
 
         NSData *empty = [NSData data];
         Finish(empty, &data, &error);
