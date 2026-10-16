@@ -287,6 +287,10 @@ int main(void) {
         NSDictionary *remastered = JPTCollectTracks(Response(@[Array(10, @[Entry(originalURI, remaster, 200)])]));
         Check([Rewrite(englishBody, [NSSet set], remastered, [NSMutableDictionary dictionary]) isEqual:englishBody],
               @"English canonical remaster does not replace the client release");
+        NSMutableArray *unchangedChanges = [NSMutableArray array];
+        JPTRewriteResponse(englishBody, [NSSet set], remastered, [NSMutableDictionary dictionary], unchangedChanges);
+        Check(![[unchangedChanges componentsJoinedByString:@"\n"] containsString:@"WARNING"],
+              @"unchanged valid TRACK_V4 does not emit a parse warning");
 
         NSMutableData *identity = [NSMutableData data], *parent = [NSMutableData data];
         JPTWriteString(identity, 1, ownURI); JPTWriteString(identity, 2, @"Localized title");
@@ -336,6 +340,10 @@ int main(void) {
         NSData *badPayload = Response(@[Array(10, @[Entry(ownURI, bad, 200)])]);
         Check([Rewrite(badPayload, [NSSet set], originals, [NSMutableDictionary dictionary]) isEqual:badPayload],
               @"malformed TRACK_V4 payload is preserved without a partial rename");
+        NSMutableArray *invalidChanges = [NSMutableArray array];
+        JPTRewriteResponse(badPayload, [NSSet set], originals, [NSMutableDictionary dictionary], invalidChanges);
+        Check([[invalidChanges componentsJoinedByString:@"\n"] containsString:@"WARNING metadata entry parse failure"],
+              @"malformed TRACK_V4 retains a real parse warning");
         Check(!Rewrite(bad, [NSSet set], originals, [NSMutableDictionary dictionary]) && !JPTCollectTracks(bad),
               @"malformed outer response fails safely");
         NSMutableData *badArray = [Array(10, @[]) mutableCopy]; [badArray appendData:bad];

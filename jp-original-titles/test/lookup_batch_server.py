@@ -104,6 +104,6 @@ print(text, end='')
 output.write_text(text)
 output.with_suffix('.requests.json').write_text(json.dumps({'requests': records, 'maximumConcurrent': maximum_active}, indent=2))
 assert result.returncode == 0, result.returncode
-assert max(record['entities'] for record in records) <= 64
+assert max(record['entities'] for record in records) <= 256
 assert maximum_active <= 3
-print(f'PASS server: {len(records)} requests, at most 64 entities per request, concurrency {maximum_active}/3')
+print(f'PASS server: {len(records)} requests, at most 256 entities per request, concurrency {maximum_active}/3')

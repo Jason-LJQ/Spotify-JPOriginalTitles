@@ -72,6 +72,17 @@ int main(int argc,const char *argv[]) {
         request.URL=[NSURL URLWithString:[base stringByAppendingString:@"/good"]];
         Await(^(void (^done)(NSError *)){JPTFetchOriginals(request,body,[NSSet setWithObject:target],done);},YES,@"a later request retries successfully after failure");
         Check(gOriginalCache[target]!=nil,@"successful retry supplies metadata");
+        NSArray *orderedTracks=[tracks.allKeys sortedArrayUsingSelector:@selector(compare:)];
+        NSSet *siblingBatch=[NSSet setWithArray:[orderedTracks subarrayWithRange:NSMakeRange(0,130)]];
+        gOriginalCache=[NSMutableDictionary dictionary];
+        Await(^(void (^done)(NSError *)){JPTFetchSiblingBatches(request,body,siblingBatch,done);},YES,@"parallel sibling batches finish under the shared limit");
+        Check(gOriginalCache.count==130,@"all parallel sibling results are merged before completion");
+        request.URL=[NSURL URLWithString:[base stringByAppendingString:@"/partial"]];gOriginalCache=[NSMutableDictionary dictionary];
+        Await(^(void (^done)(NSError *)){JPTFetchSiblingBatches(request,body,siblingBatch,done);},NO,@"parallel sibling batches report missing entries");
+        Check(gOriginalCache.count==129,@"parallel partial failure retains exactly the valid entries");
+        request.URL=[NSURL URLWithString:[base stringByAppendingString:@"/good"]];
+        Await(^(void (^done)(NSError *)){JPTFetchSiblingBatches(request,body,siblingBatch,done);},YES,@"failed parallel entries remain retryable");
+        Check(gOriginalCache.count==130,@"parallel retry completes the missing metadata");
         gDelegateClasses=[NSMutableArray array];JPTHookDelegate(@"JPTBatchDelegate");gOriginalCache=[NSMutableDictionary dictionary];
         ClientRequest([base stringByAppendingString:@"/client-failure"],target);
         Check(!deliveryError && received.length>0,@"failed enrichment delivers official data without a lookup error");
