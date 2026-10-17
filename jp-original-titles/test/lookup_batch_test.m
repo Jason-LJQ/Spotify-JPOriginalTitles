@@ -95,7 +95,7 @@ int main(int argc,const char *argv[]) {
         dispatch_group_t group=dispatch_group_create();__block NSUInteger failed=0;
         for(NSUInteger i=0;i<9;i++) { dispatch_group_enter(group);JPTFetchOriginals(request,body,[NSSet setWithObject:target],^(NSError *error){if(error){@synchronized(gOriginalCache){failed++;}}dispatch_group_leave(group);}); }
         Check(dispatch_group_wait(group,dispatch_time(DISPATCH_TIME_NOW,20*NSEC_PER_SEC))==0 && !failed,@"parallel lookup jobs all finish under the shared concurrency bound");
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:kJPTArtistNamesKey];
+        JPTStorageClear();
         printf("%lu checks passed\n",(unsigned long)checks);
     }return 0;
 }

@@ -1,15 +1,12 @@
 // Tracks verified previous names independently from the replacement-name cache.
 #ifndef JPT_PREVIOUS_METADATA
 #define JPT_PREVIOUS_METADATA
-#import <math.h>
+#include "JPTStorage.m"
 static NSString *const kJPTPreviousMetadataKey = @"JPOriginalTitlesCreditsPreviousMetadataV1";
 static NSMutableDictionary *gJPTPreviousMetadataRecords;
 
 static NSObject *JPTPreviousLock(void) {
-    static NSObject *lock;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ lock = [NSObject new]; });
-    return lock;
+    return JPTStorageLock();
 }
 
 static BOOL JPTPreviousHasText(id value) {
@@ -23,27 +20,7 @@ static BOOL JPTPreviousValidURI(id uri) {
 
 static void JPTPreviousLoadLocked(void) {
     if (gJPTPreviousMetadataRecords) return;
-    id saved = [[NSUserDefaults standardUserDefaults] objectForKey:kJPTPreviousMetadataKey];
-    gJPTPreviousMetadataRecords = [NSMutableDictionary dictionary];
-    if ([saved isKindOfClass:NSDictionary.class]) for (id uri in saved) {
-        id record = saved[uri];
-        if (!JPTPreviousValidURI(uri) || ![record isKindOfClass:NSDictionary.class]) continue;
-        id touched = record[@"touched"], sourceFields = record[@"fields"];
-        if (![touched isKindOfClass:NSNumber.class] || !isfinite([touched doubleValue])
-            || ![sourceFields isKindOfClass:NSDictionary.class]) continue;
-        NSMutableDictionary *fields = [NSMutableDictionary dictionary];
-        for (NSString *field in @[@"title", @"artists", @"album"]) {
-            id pair = sourceFields[field];
-            if (![pair isKindOfClass:NSDictionary.class]) continue;
-            id old = pair[@"old"], now = pair[@"new"], rank = pair[@"rank"];
-            if (JPTPreviousHasText(old) && JPTPreviousHasText(now) && ![old isEqualToString:now]
-                && [rank isKindOfClass:NSNumber.class] && [rank integerValue] >= 1 && [rank integerValue] <= 3)
-                fields[field] = @{@"old": old, @"new": now, @"rank": @([rank integerValue])};
-        }
-        if (fields.count) gJPTPreviousMetadataRecords[uri] = @{@"fields": fields, @"touched": @(MIN([touched doubleValue], [NSDate timeIntervalSinceReferenceDate]))};
-    }
-    if (saved && ![saved isEqual:gJPTPreviousMetadataRecords])
-        [[NSUserDefaults standardUserDefaults] setObject:[gJPTPreviousMetadataRecords copy] forKey:kJPTPreviousMetadataKey];
+    gJPTPreviousMetadataRecords = JPTStorageLoad(YES);
 }
 
 static NSUInteger JPTPreviousRecordCount(void) {
@@ -146,8 +123,8 @@ static NSDictionary *JPTPreviousSearchCarriers(NSData *body) {
     return carriers;
 }
 
-static void JPTPreviousCompare(NSDictionary *before, NSDictionary *after) {
-    if (!before || !after) return;
+static BOOL JPTPreviousCompare(NSDictionary *before, NSDictionary *after) {
+    if (!before || !after) { @synchronized (JPTStorageLock()) { return JPTStorageCommit(@[]); } }
     NSMutableDictionary *observations = [NSMutableDictionary dictionary];
     for (NSString *carrier in before) {
         NSArray *oldEntries = before[carrier], *newEntries = after[carrier];
@@ -170,7 +147,8 @@ static void JPTPreviousCompare(NSDictionary *before, NSDictionary *after) {
     }
     @synchronized (JPTPreviousLock()) {
         JPTPreviousLoadLocked();
-        BOOL dirty = NO;
+        NSMutableArray *changes = [NSMutableArray array];
+        NSMutableDictionary *updates = [NSMutableDictionary dictionary];
         for (NSString *uri in observations) {
             if (!JPTPreviousValidURI(uri)) continue;
             NSDictionary *existing = gJPTPreviousMetadataRecords[uri];
@@ -206,27 +184,31 @@ static void JPTPreviousCompare(NSDictionary *before, NSDictionary *after) {
                     } else if ([final isEqual:previous[@"new"]])
                         replacement = @{@"old": previous[@"old"], @"new": final, @"rank": @(rank)};
                 }
-                if (replacement && ![replacement isEqual:previous]) { fields[field] = replacement; changedRecord = YES; }
-                else if (!replacement && previous) { [fields removeObjectForKey:field]; changedRecord = YES; }
+                if ([replacement isEqual:previous] || (!replacement && !previous)) continue;
+                NSMutableDictionary *change = [@{@"uri": uri, @"field": field} mutableCopy];
+                if (replacement) { fields[field] = replacement; change[@"pair"] = replacement; }
+                else [fields removeObjectForKey:field];
+                [changes addObject:change]; changedRecord = YES;
             }
             if (!changedRecord) continue;
-            if (fields.count) gJPTPreviousMetadataRecords[uri] = @{@"fields": fields, @"touched": @([NSDate timeIntervalSinceReferenceDate])};
-            else [gJPTPreviousMetadataRecords removeObjectForKey:uri];
-            dirty = YES;
+            updates[uri] = fields.count ? @{@"fields": fields} : (id)NSNull.null;
         }
-        if (dirty) {
-            [[NSUserDefaults standardUserDefaults] setObject:[gJPTPreviousMetadataRecords copy] forKey:kJPTPreviousMetadataKey];
+        if (!JPTStorageCommit(changes)) return NO;
+        for (NSString *uri in updates) {
+            if (updates[uri] == NSNull.null) [gJPTPreviousMetadataRecords removeObjectForKey:uri];
+            else gJPTPreviousMetadataRecords[uri] = updates[uri];
         }
+        return YES;
     }
 }
 
-static void JPTCapturePreviousResponse(NSData *before, NSData *after) {
-    if (!after) return;
-    JPTPreviousCompare(JPTPreviousResponseCarriers(before), JPTPreviousResponseCarriers(after));
+static BOOL JPTCapturePreviousResponse(NSData *before, NSData *after) {
+    if (!after) return YES;
+    return JPTPreviousCompare(JPTPreviousResponseCarriers(before), JPTPreviousResponseCarriers(after));
 }
 
-static void JPTCapturePreviousSearch(NSData *before, NSData *after) {
-    if (!after) return;
-    JPTPreviousCompare(JPTPreviousSearchCarriers(before), JPTPreviousSearchCarriers(after));
+static BOOL JPTCapturePreviousSearch(NSData *before, NSData *after) {
+    if (!after) return YES;
+    return JPTPreviousCompare(JPTPreviousSearchCarriers(before), JPTPreviousSearchCarriers(after));
 }
 #endif

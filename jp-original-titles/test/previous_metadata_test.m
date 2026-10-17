@@ -9,7 +9,7 @@ static void Check(BOOL condition, NSString *label) {
 static void Reset(void) {
     @synchronized (JPTPreviousLock()) {
         gJPTPreviousMetadataRecords = [NSMutableDictionary dictionary];
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:kJPTPreviousMetadataKey];
+        JPTStorageClear();
     }
 }
 static NSData *Value(NSString *title, NSString *album, NSArray *artists, BOOL identity) {
@@ -78,7 +78,7 @@ int main(void) {
         Check(JPTPreviousFields(uri).count == 2 && !JPTPreviousFields(uri)[@"title"], @"different official unchanged title invalidates only title");
         JPTCapturePreviousResponse(old, filled);
         gJPTPreviousMetadataRecords = nil;
-        Check([JPTPreviousFields(uri)[@"title"] isEqual:@"Old"], @"defaults reload");
+        Check([JPTPreviousFields(uri)[@"title"] isEqual:@"Old"], @"SQLite reload");
         Reset();
         NSData *trackBefore = Response(uri, Value(@"Track old", @"Album", @[@"Artist"], NO), 10);
         NSData *trackAfter = Response(uri, Value(@"New", @"Album", @[@"Artist"], NO), 10);
@@ -175,18 +175,15 @@ int main(void) {
         JPTCapturePreviousResponse(multiOld, reordered);
         Check([JPTPreviousFields(uri)[@"artists"] isEqual:@"One, Two"], @"artist order is part of the field");
         Reset();
-        [[NSUserDefaults standardUserDefaults] setObject:@[@"wrong top level"] forKey:kJPTPreviousMetadataKey];
+        NSDictionary *valid = @{@"fields": @{@"title": @{@"old": @"Raw", @"new": @"Localized", @"rank": @3}}};
+        JPTStorageOpen();
+        JPTStorageExec("INSERT INTO previous_fields VALUES('spotify:track:bad','title','','New',3)");
         gJPTPreviousMetadataRecords = nil;
-        Check(!JPTPreviousFields(uri).count, @"corrupt top-level defaults isolated");
-        NSDictionary *valid = @{@"fields": @{@"title": @{@"old": @"Raw", @"new": @"Localized", @"rank": @3}}, @"touched": @100};
-        [[NSUserDefaults standardUserDefaults] setObject:@{uri: valid, two: @"bad record", @"spotify:track:three": @{@"fields": @[], @"touched": @1}, @"spotify:track:four": @{@"fields": @{@"title": @"bad pair"}, @"touched": @1}, @"spotify:track:five": @{@"fields": @{@"title": @{@"old": @1, @"new": @"A", @"rank": @3}}, @"touched": @1}} forKey:kJPTPreviousMetadataKey];
-        gJPTPreviousMetadataRecords = nil;
-        Check([JPTPreviousFields(uri)[@"title"] isEqual:@"Raw"] && gJPTPreviousMetadataRecords.count == 1, @"bad records and fields do not discard valid neighbors");
-        Check([[[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTPreviousMetadataKey] count] == 1, @"corrupt defaults cleaned persistently");
+        Check(!JPTPreviousFields(@"spotify:track:bad").count, @"invalid database row isolated");
         Reset();
-        NSMutableDictionary *many = [NSMutableDictionary dictionary];
-        for (NSUInteger i = 0; i < 2048; i++) many[[NSString stringWithFormat:@"spotify:track:%03lu", (unsigned long)i]] = @{@"fields": valid[@"fields"], @"touched": @(i)};
-        [[NSUserDefaults standardUserDefaults] setObject:many forKey:kJPTPreviousMetadataKey];
+        NSMutableArray *many = [NSMutableArray array];
+        for (NSUInteger i = 0; i < 2048; i++) [many addObject:@{@"uri": [NSString stringWithFormat:@"spotify:track:%03lu", (unsigned long)i], @"field": @"title", @"pair": valid[@"fields"][@"title"]}];
+        Check(JPTStorageCommit(many), @"bulk fixture transaction commits");
         gJPTPreviousMetadataRecords = nil;
         Check([JPTPreviousFields(@"spotify:track:2047")[@"title"] isEqual:@"Raw"] && gJPTPreviousMetadataRecords.count == 2048, @"load retains all records beyond the former cap");
         Check(JPTPreviousFields(@"spotify:track:000").count == 1 && JPTPreviousFields(@"spotify:track:007").count == 1, @"oldest valid records are retained");

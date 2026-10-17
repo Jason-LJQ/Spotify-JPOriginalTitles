@@ -57,9 +57,9 @@ int main(void) { @autoreleasepool {
     NSArray *rows=Rows(Values(after)[0]);
     Check(rows.count==4,@"three changed dimensions create three native rows");
     Check([rows[0] isEqual:@[@"Writer",@"Official Author",@""]],@"official contributor preserved");
-    Check([rows[1] isEqual:@[@"Previous metadata",@"Kyuseishu",@"Previous title"]],@"title uses exact previous value");
-    Check([rows[2] isEqual:@[@"Previous metadata",@"Artist A, Artist B",@"Previous artist"]],@"artist list preserves order");
-    Check([rows[3] isEqual:@[@"Previous metadata",@"Album",@"Previous album"]],@"album row present");
+    Check([rows[1] isEqual:@[@"Original Metadata",@"Kyuseishu",@"Title"]],@"title uses exact previous value");
+    Check([rows[2] isEqual:@[@"Original Metadata",@"Artist A, Artist B",@"Artist"]],@"artist list preserves order");
+    Check([rows[3] isEqual:@[@"Original Metadata",@"Album",@"Album"]],@"album row present");
     NSData *value=Values(after)[0];Check([[value subdataWithRange:NSMakeRange(0,official.length)] isEqual:official],@"official credits and unknown bytes are unchanged prefix");
     NSMutableData *expected=[official mutableCopy];for(NSArray *row in [rows subarrayWithRange:NSMakeRange(1,3)]) { NSMutableData *c=[NSMutableData data];JPTWriteString(c,1,row[1]);JPTWriteString(c,2,row[2]);JPTWriteData(c,6,Text(1,row[0]));JPTWriteData(expected,1,c); }
     Check([after isEqual:Response(@[Entry(expected,uri,200)],186)],@"outer entry Any and unknown fields preserved");
@@ -76,7 +76,7 @@ int main(void) { @autoreleasepool {
     Check(equalRows.count==3 && [equalRows[1][1] isEqual:equalRows[2][1]] && ![equalRows[1][2] isEqual:equalRows[2][2]],@"identical previous title and album have distinct native roles");
     Seed(@{});Check([JPTNativeCreditsResponse(before)isEqual:before],@"missing record unchanged");
     Seed(@{@"title":Pair(@"Kyuseishu",@"救世主")});
-    NSMutableData *collision=[official mutableCopy];JPTWriteData(collision,1,Contributor(@"Kyuseishu",@"Previous title",YES));
+    NSMutableData *collision=[official mutableCopy];JPTWriteData(collision,1,Contributor(@"Kyuseishu",@"Title",YES));
     Check(Rows(Values(JPTNativeCreditsResponse(Response(@[Entry(collision,uri,200)],186)))[0]).count==3,@"navigable official collision is not treated as prototype row");
     const uint8_t invalid[]={0x0a,0x80};NSData *bad=[NSData dataWithBytes:invalid length:sizeof(invalid)];
     NSData *badEntry=Response(@[Entry(bad,uri,200)],186);Check([JPTNativeCreditsResponse(badEntry)isEqual:badEntry],@"malformed credits retained");

@@ -70,18 +70,18 @@ static NSData *JPTNativeCreditsValue(const JPTField *value, NSDictionary *previo
             }
         }
         if (!cok) return nil;
-        if (!navigable && name && role && [group isEqualToString:@"Previous metadata"]) [existing addObject:@[role, name]];
+        if (!navigable && name && role && [group isEqualToString:@"Original Metadata"]) [existing addObject:@[role, name]];
     }
     if (!ok) return nil;
     NSMutableData *out = [NSMutableData dataWithBytes:value->data length:value->len];
     BOOL changed = NO;
     NSArray *keys = @[@"title", @"artists", @"album"];
-    NSArray *labels = @[@"Previous title", @"Previous artist", @"Previous album"];
+    NSArray *labels = @[@"Title", @"Artist", @"Album"];
     for (NSUInteger i = 0; i < keys.count; i++) {
         NSString *name = previous[keys[i]], *label = labels[i];
         if (!JPTPreviousHasText(name) || [existing containsObject:@[label, name]]) continue;
         NSMutableData *group = [NSMutableData data], *contributor = [NSMutableData data];
-        JPTWriteString(group, 1, @"Previous metadata");
+        JPTWriteString(group, 1, @"Original Metadata");
         JPTWriteString(contributor, 1, name);
         JPTWriteString(contributor, 2, label);
         JPTWriteData(contributor, 6, group);

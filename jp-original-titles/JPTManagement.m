@@ -7,15 +7,14 @@
 #import <fcntl.h>
 #import <unistd.h>
 #import <limits.h>
+#include "JPTStorage.m"
 
-static NSString *const kJPTCacheVersion = @"6.3";
-static NSString *const kJPTCacheVersionKey = @"JPOriginalTitlesCacheVersion";
 static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
-static NSString *const kJPTPendingResetKey = @"JPOriginalTitlesPendingReset";
+static NSString *const kJPTResetRequestKey = @"JPOriginalTitlesResetRequest";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
 static NSString *const kJPTMetadataPromptKey = @"JPOriginalTitlesMetadataPromptOffered";
-static NSString *const kJPTBuild = @"v7";
-static NSString *const kJPTBuildID = @"20261016-previous-metadata-no-eviction";
+static NSString *const kJPTBuild = @"v7.0.1";
+static NSString *const kJPTBuildID = @"20261017-all-cache-original-metadata";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
 static atomic_bool gJPTStrict;
@@ -94,24 +93,40 @@ static void JPTLog(NSString *format, ...) {
     });
 }
 
-static NSString *JPTScopeName(NSString *scope) {
-    if ([scope isEqualToString:@"metadata"]) return @"Spotify metadata and library index";
-    if ([scope isEqualToString:@"playback"]) return @"Playback resume state";
-    return @"Plugin name cache";
+static NSString *JPTSelectionName(NSDictionary *reset) {
+    NSMutableArray *names = [NSMutableArray array];
+    if ([reset[@"plugin"] boolValue]) [names addObject:@"Plugin cache"];
+    if ([reset[@"metadata"] boolValue]) [names addObject:@"Spotify metadata and library index"];
+    if ([reset[@"playback"] boolValue]) [names addObject:@"Playback resume state"];
+    if (!names.count && [reset[@"scope"] isKindOfClass:NSString.class]) {
+        NSString *scope = reset[@"scope"];
+        [names addObject:[scope isEqual:@"metadata"] ? @"Spotify metadata and library index"
+            : [scope isEqual:@"playback"] ? @"Playback resume state" : @"Plugin cache"];
+    }
+    return [names componentsJoinedByString:@" + "];
 }
 
-static NSString *JPTSelectionName(NSDictionary *reset) {
-    NSString *name = JPTScopeName(reset[@"scope"]);
-    return [reset[@"playback"] boolValue] && ![reset[@"scope"] isEqualToString:@"playback"]
-        ? [name stringByAppendingString:@" + Playback resume state"] : name;
+static NSString *JPTLocalResetDate(id value) {
+    NSDate *date = [value isKindOfClass:NSDate.class] ? value : nil;
+    if (!date && [value isKindOfClass:NSString.class]) {
+        NSDateFormatter *legacy = [NSDateFormatter new];
+        legacy.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        legacy.dateFormat = @"yyyy-MM-dd HH:mm:ss Z";
+        date = [legacy dateFromString:value];
+    }
+    if (!date) return @"Unknown time";
+    NSDateFormatter *formatter = [NSDateFormatter new];
+    formatter.dateStyle = NSDateFormatterMediumStyle; formatter.timeStyle = NSDateFormatterMediumStyle;
+    formatter.timeZone = NSTimeZone.defaultTimeZone;
+    return [formatter stringFromDate:date];
 }
 
 static NSString *JPTResetSummary(void) {
     NSDictionary *last = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTLastResetKey];
     if (!last) return @"No reset recorded";
-    NSString *state = [last[@"success"] boolValue] ? @"Succeeded" : @"Failed; retry available";
-    return [NSString stringWithFormat:@"%@ · %@ · %@ (%@ databases, %@ playback states removed)", last[@"date"],
-            JPTSelectionName(last), state, last[@"removed"] ?: @0, last[@"playbackRemoved"] ?: @0];
+    NSString *state = [last[@"success"] boolValue] ? @"Succeeded" : @"Failed";
+    return [NSString stringWithFormat:@"%@ · %@ · %@ (%@ databases, %@ playback states removed)", JPTLocalResetDate(last[@"date"]),
+        JPTSelectionName(last), state, last[@"removed"] ?: @0, last[@"playbackRemoved"] ?: @0];
 }
 
 #ifndef JPT_MANAGEMENT_TEST
@@ -136,9 +151,9 @@ static NSString *JPTDiagnosticSummary(void) {
     }
     [lines addObject:JPTStrictSummary()];
     [lines addObject:[NSString stringWithFormat:@"Logging: %@", atomic_load(&gJPTLogging) ? @"on" : @"off"]];
-    [lines addObject:[NSString stringWithFormat:@"Original cache: %lu; artist names: %lu", (unsigned long)JPTOriginalSnapshot().count,
-                      (unsigned long)JPTArtistNamesSnapshot().count]];
-    [lines addObject:[NSString stringWithFormat:@"Previous metadata records: %lu", (unsigned long)JPTPreviousRecordCount()]];
+    [lines addObject:JPTStorageSummary()];
+    [lines addObject:[@"Plugin database: " stringByAppendingString:JPTStoragePath()]];
+    [lines addObject:[NSString stringWithFormat:@"In-memory original tracks: %lu", (unsigned long)JPTOriginalSnapshot().count]];
     NSString *users = JPTUsersPath();
     [lines addObject:[@"Metadata directory: " stringByAppendingString:users ?: @"unavailable"]];
     [lines addObject:[@"Foundation home: " stringByAppendingString:NSHomeDirectory() ?: @"unavailable"]];
@@ -151,12 +166,9 @@ static NSString *JPTDiagnosticSummary(void) {
     for (NSString *user in [fm contentsOfDirectoryAtPath:users error:nil])
         if ([fm fileExistsAtPath:[[users stringByAppendingPathComponent:user] stringByAppendingPathComponent:@"primary.ldb"]]) count++;
     [lines addObject:[NSString stringWithFormat:@"Current databases: %lu; database open: %@", (unsigned long)count, JPTDatabaseIsOpen() ? @"yes" : @"no"]];
-    NSDictionary *pending = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTPendingResetKey];
-    [lines addObject:[NSString stringWithFormat:@"Pending reset: %@", pending ? JPTSelectionName(pending) : @"none"]];
     [lines addObject:JPTResetSummary()];
     NSDictionary *last = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTLastResetKey];
     if (last[@"targets"]) [lines addObject:[NSString stringWithFormat:@"Startup database targets: %@; user directory exists: %@; database open: %@", last[@"targets"], last[@"usersExist"], last[@"databaseOpen"]]];
-    [lines addObject:[NSString stringWithFormat:@"Cache version: %@", [[NSUserDefaults standardUserDefaults] stringForKey:kJPTCacheVersionKey] ?: @"unset"]];
     if (last[@"errors"]) [lines addObject:[NSString stringWithFormat:@"Reset errors: %@", last[@"errors"]]];
     return [lines componentsJoinedByString:@"\n"];
 }
@@ -186,135 +198,86 @@ static BOOL JPTPlainDirectory(NSString *path) {
 }
 
 static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
-    NSMutableDictionary *pending = [[defaults dictionaryForKey:kJPTPendingResetKey] mutableCopy];
-    BOOL migration = ![[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion];
-    NSDictionary *last = [defaults dictionaryForKey:kJPTLastResetKey];
-    // Automatic upgrades reset plugin state only; Spotify caches require an explicit selection.
-    if (!pending && migration && ![last[@"migration"] isEqualToString:kJPTCacheVersion]) {
-        pending = [@{@"scope": @"plugin", @"migration": kJPTCacheVersion} mutableCopy];
-    }
-    if (pending[@"migration"]) {
-        pending = [@{@"scope": @"plugin", @"migration": kJPTCacheVersion} mutableCopy];
-    }
-    if (!pending || [pending[@"failed"] boolValue]) return;
-    NSString *scope = pending[@"scope"];
+    // Obsolete queued maintenance is never replayed as a new selection.
+    [defaults removeObjectForKey:@"JPOriginalTitlesPendingReset"];
+    [defaults removeObjectForKey:@"JPOriginalTitlesArtistNames"];
+    [defaults removeObjectForKey:@"JPOriginalTitlesCreditsPreviousMetadataV1"];
+    [defaults removeObjectForKey:@"JPOriginalTitlesCacheVersion"];
+    NSDictionary *request = [defaults dictionaryForKey:kJPTResetRequestKey];
+    if (!request) { [defaults synchronize]; return; }
+    BOOL metadata = [request[@"metadata"] boolValue], playback = [request[@"playback"] boolValue];
+    BOOL plugin = [request[@"plugin"] boolValue];
     NSMutableArray *errors = [NSMutableArray array];
-    NSMutableArray *remaining = [NSMutableArray array];
-    BOOL metadata = [scope isEqualToString:@"metadata"];
-    BOOL playback = [scope isEqualToString:@"playback"] || [pending[@"playback"] boolValue];
-    NSUInteger playbackRemoved = 0;
-    NSUInteger removed = 0;
-    NSArray *targets = nil;
-    BOOL targetListKnown = NO;
+    NSUInteger removed = 0, playbackRemoved = 0;
     BOOL open = JPTResetFilesAreOpen(metadata, playback);
     if (metadata || playback) {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        targets = pending[@"remaining"];
-        targetListKnown = targets != nil;
-        if (!targets) {
-            NSError *error = nil;
-            NSArray *entries = [fm contentsOfDirectoryAtPath:users error:&error];
-            targetListKnown = !error || error.code == NSFileReadNoSuchFileError;
-            if (error && error.code != NSFileReadNoSuchFileError) {
-                [errors addObject:[NSString stringWithFormat:@"enumeration %@/%ld", error.domain, (long)error.code]];
-            }
-            NSMutableArray *found = [NSMutableArray array];
-            for (NSString *user in entries) {
-                NSString *path = [[users stringByAppendingPathComponent:user] stringByAppendingPathComponent:@"primary.ldb"];
-                NSString *resume = [[users stringByAppendingPathComponent:user] stringByAppendingPathComponent:@"context_player_state_restore"];
-                if ((metadata && [fm fileExistsAtPath:path]) || (playback && [fm fileExistsAtPath:resume])) [found addObject:user];
-            }
-            targets = found;
-        }
-        if (metadata && !targets.count && !pending[@"remaining"]) {
-            [errors addObject:@"no metadata database found; cache version unchanged"];
-        }
-        if (open) [errors addObject:@"selected cache already open; deletion skipped"];
-        for (NSString *user in targets) {
-            // The stored retry list contains directory names only, never arbitrary paths.
-            if (![user isKindOfClass:[NSString class]] || !user.length || ![user isEqualToString:user.lastPathComponent]
-                || [user isEqualToString:@"."] || [user isEqualToString:@".."]) {
-                [errors addObject:@"invalid retry target"]; continue;
-            }
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSError *enumerationError = nil;
+        NSArray *entries = [fm contentsOfDirectoryAtPath:users error:&enumerationError];
+        if (enumerationError && enumerationError.code != NSFileReadNoSuchFileError)
+            [errors addObject:[NSString stringWithFormat:@"enumeration error %ld", (long)enumerationError.code]];
+        if (open) [errors addObject:@"Selected Spotify cache already open; deletion skipped"];
+        for (NSString *user in entries) {
             NSString *dir = [users stringByAppendingPathComponent:user];
-            NSString *db = [dir stringByAppendingPathComponent:@"primary.ldb"];
-            NSError *error = nil;
             BOOL safeParent = !open && JPTPlainDirectory(users) && JPTPlainDirectory(dir);
             NSString *resume = [dir stringByAppendingPathComponent:@"context_player_state_restore"];
+            NSError *error = nil;
             if (playback && [fm fileExistsAtPath:resume]) {
                 struct stat info;
-                BOOL safeResume = safeParent && lstat(resume.fileSystemRepresentation, &info) == 0 && S_ISREG(info.st_mode);
-                if (safeResume && [fm removeItemAtPath:resume error:&error]) playbackRemoved++;
-                else {
-                    [remaining addObject:user];
-                    [errors addObject:error ? [NSString stringWithFormat:@"playback deletion %@/%ld", error.domain, (long)error.code] : @"unsafe/open playback state; reset skipped"];
-                    continue;
-                }
+                BOOL safe = safeParent && lstat(resume.fileSystemRepresentation, &info) == 0 && S_ISREG(info.st_mode);
+                if (safe && [fm removeItemAtPath:resume error:&error]) playbackRemoved++;
+                else { [errors addObject:@"Playback state could not be removed"]; continue; }
             }
-            if (!metadata || ![fm fileExistsAtPath:db]) continue;
-            BOOL safe = safeParent && JPTPlainDirectory(db);
-            if (safe && [fm removeItemAtPath:db error:&error]) removed++;
-            else {
-                [remaining addObject:user];
-                [errors addObject:error ? [NSString stringWithFormat:@"deletion %@/%ld", error.domain, (long)error.code] : @"unsafe/open database; deletion skipped"];
+            NSString *db = [dir stringByAppendingPathComponent:@"primary.ldb"];
+            if (metadata && [fm fileExistsAtPath:db]) {
+                if (safeParent && JPTPlainDirectory(db) && [fm removeItemAtPath:db error:&error]) removed++;
+                else [errors addObject:@"Spotify metadata could not be removed"];
             }
         }
     }
-    if (![scope isEqualToString:@"playback"]) {
-        [defaults removeObjectForKey:kJPTArtistNamesKey];
-        [defaults removeObjectForKey:@"JPOriginalTitlesCreditsPreviousMetadataV1"];
+    if (plugin) {
+        if (!JPTStorageClear()) [errors addObject:gJPTStorageError ?: @"Plugin cache could not be cleared"];
+#ifndef JPT_MANAGEMENT_TEST
+        else { @synchronized (JPTStorageLock()) { gJPTPreviousMetadataRecords = nil; } }
+#endif
     }
-    BOOL ok = errors.count == 0;
-    NSMutableDictionary *result = [@{@"scope": scope ?: @"plugin", @"date": [NSDate date].description,
-        @"success": @(ok), @"removed": @(removed), @"databaseOpen": @(open), @"errors": errors} mutableCopy];
-    result[@"usersPath"] = users ?: @"";
-    result[@"targets"] = @(targets.count);
-    result[@"playback"] = @(playback);
-    result[@"playbackRemoved"] = @(playbackRemoved);
-    result[@"usersExist"] = @([[NSFileManager defaultManager] fileExistsAtPath:users]);
-    if (pending[@"migration"]) result[@"migration"] = pending[@"migration"];
+    NSMutableDictionary *result = [request mutableCopy];
+    result[@"date"] = [NSDate date]; result[@"success"] = @(errors.count == 0);
+    result[@"removed"] = @(removed); result[@"playbackRemoved"] = @(playbackRemoved);
+    result[@"errors"] = errors;
     [defaults setObject:result forKey:kJPTLastResetKey];
-    if (ok) {
-        [defaults removeObjectForKey:kJPTPendingResetKey];
-        if (pending[@"migration"] && migration) [defaults setObject:kJPTCacheVersion forKey:kJPTCacheVersionKey];
-    } else {
-        pending[@"failed"] = @YES;
-        // Re-enumerate only when enumeration itself failed; otherwise retry failed targets alone.
-        if (targetListKnown) pending[@"remaining"] = remaining;
-        [defaults setObject:pending forKey:kJPTPendingResetKey];
-    }
+    [defaults removeObjectForKey:kJPTResetRequestKey];
     [defaults synchronize];
-    JPTLog(@"startup reset %@: removed %lu, playback removed %lu, open %d, errors %lu", scope, (unsigned long)removed, (unsigned long)playbackRemoved, open, (unsigned long)errors.count);
+    JPTLog(@"startup reset %@: metadata %lu, playback %lu, errors %lu", JPTSelectionName(request),
+        (unsigned long)removed, (unsigned long)playbackRemoved, (unsigned long)errors.count);
 }
 
-// Persist before quitting; retries retain only the targets that previously failed.
-static BOOL JPTSavePendingReset(NSUserDefaults *defaults, NSString *scope, BOOL playback, BOOL retry) {
-    id previous = [defaults objectForKey:kJPTPendingResetKey];
-    NSMutableDictionary *pending = retry ? [[defaults dictionaryForKey:kJPTPendingResetKey] mutableCopy] : [NSMutableDictionary dictionary];
-    if (!pending) return NO;
-    pending[@"scope"] = scope;
-    if (!retry) pending[@"playback"] = @(playback);
-    [pending removeObjectForKey:@"failed"];
-    [defaults setObject:pending forKey:kJPTPendingResetKey];
+static BOOL JPTSaveResetRequest(NSUserDefaults *defaults, BOOL plugin, BOOL metadata, BOOL playback) {
+    if (!plugin && !metadata && !playback) return NO;
+    id previous = [defaults objectForKey:kJPTResetRequestKey];
+    [defaults setObject:@{@"plugin": @(plugin), @"metadata": @(metadata), @"playback": @(playback)} forKey:kJPTResetRequestKey];
     if ([defaults synchronize]) return YES;
-    if (previous) [defaults setObject:previous forKey:kJPTPendingResetKey];
-    else [defaults removeObjectForKey:kJPTPendingResetKey];
-    [defaults synchronize];
-    return NO;
+    if (previous) [defaults setObject:previous forKey:kJPTResetRequestKey];
+    else [defaults removeObjectForKey:kJPTResetRequestKey];
+    [defaults synchronize]; return NO;
 }
 
 static BOOL JPTMetadataPromptRequired(NSUserDefaults *defaults) {
-    return ![defaults boolForKey:kJPTMetadataPromptKey] && ![defaults objectForKey:kJPTPendingResetKey];
-}
-
-static BOOL JPTClaimMetadataPrompt(NSUserDefaults *defaults) {
-    if (!JPTMetadataPromptRequired(defaults)) return NO;
-    [defaults setBool:YES forKey:kJPTMetadataPromptKey];
-    return [defaults synchronize];
+    return ![[defaults objectForKey:kJPTMetadataPromptKey] isEqual:kJPTBuild]
+        && ![defaults objectForKey:kJPTResetRequestKey];
 }
 
 static BOOL JPTMetadataPromptChoice(NSUserDefaults *defaults, BOOL confirm) {
-    return !confirm || JPTSavePendingReset(defaults, @"metadata", NO, NO);
+    id previousVersion = [defaults objectForKey:kJPTMetadataPromptKey];
+    id previousRequest = [defaults objectForKey:kJPTResetRequestKey];
+    if (confirm) [defaults setObject:@{@"plugin": @YES, @"metadata": @YES, @"playback": @YES} forKey:kJPTResetRequestKey];
+    [defaults setObject:kJPTBuild forKey:kJPTMetadataPromptKey];
+    if ([defaults synchronize]) return YES;
+    if (previousVersion) [defaults setObject:previousVersion forKey:kJPTMetadataPromptKey];
+    else [defaults removeObjectForKey:kJPTMetadataPromptKey];
+    if (previousRequest) [defaults setObject:previousRequest forKey:kJPTResetRequestKey];
+    else [defaults removeObjectForKey:kJPTResetRequestKey];
+    [defaults synchronize]; return NO;
 }
 
 #ifndef JPT_MANAGEMENT_TEST
@@ -369,16 +332,14 @@ static void JPTScheduleMetadataPrompt(void) {
         }
         JPTLog(@"first-launch prompt presenter %@ bounds %@ window %@", NSStringFromClass(host.class),
                NSStringFromCGRect(host.view.bounds), NSStringFromCGRect(host.view.window.bounds));
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Refresh Spotify Metadata?"
-            message:@"Clear cached Spotify metadata to improve original-name accuracy and collect previous names for Credits?\n\nSpotify will close. Reopen it to refresh metadata and resync the library online. Login, audio files and playback resume state are kept."
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Clear All Caches?"
+            message:@"Clear cached data and playback state to improve accuracy? Spotify will close. Reopen it to continue."
             preferredStyle:UIAlertControllerStyleAlert];
         __weak UIAlertController *weakAlert = alert;
         [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
-            JPTClaimMetadataPrompt(defaults);
             JPTMetadataPromptChoice(defaults, NO);
         }]];
         [alert addAction:[UIAlertAction actionWithTitle:@"Confirm" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            JPTClaimMetadataPrompt(defaults);
             if (!JPTMetadataPromptChoice(defaults, YES)) {
                 UIAlertController *error = [UIAlertController alertControllerWithTitle:@"Reset Not Saved"
                     message:@"Spotify will stay open. You can retry from Settings and privacy → Original Titles."
@@ -394,8 +355,7 @@ static void JPTScheduleMetadataPrompt(void) {
         gJPTMetadataPromptPresenting = YES;
         void (^verify)(void) = ^{
             gJPTMetadataPromptPresenting = NO;
-            if (alert.presentingViewController && alert.isViewLoaded && alert.view.window) JPTClaimMetadataPrompt(defaults);
-            else JPTScheduleMetadataPrompt();
+            if (!(alert.presentingViewController && alert.isViewLoaded && alert.view.window)) JPTScheduleMetadataPrompt();
         };
         [host presentViewController:alert animated:YES completion:verify];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
@@ -416,7 +376,6 @@ static void JPTInstallMetadataPrompt(void) {
 @property (nonatomic) BOOL resetPlugin;
 @property (nonatomic) BOOL resetMetadata;
 @property (nonatomic) BOOL resetPlayback;
-@property (nonatomic) BOOL retryFailed;
 @end
 
 @implementation JPTManagementController
@@ -432,15 +391,15 @@ static void JPTInstallMetadataPrompt(void) {
 - (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self refresh]; }
 - (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)refresh {
-    self.navigationItem.rightBarButtonItem.enabled = self.resetPlugin || self.resetMetadata || self.resetPlayback || self.retryFailed;
+    self.navigationItem.rightBarButtonItem.enabled = self.resetPlugin || self.resetMetadata || self.resetPlayback;
     [self.tableView reloadData];
 }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return section == 0 ? 4 : section == 1 ? 4 : 6; }
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return section == 0 ? 4 : section == 1 ? 4 : 3; }
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section { return @[@"Status", @"Diagnostics", @"Reset Options"][section]; }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 1) return @"Logging is off by default. Logs may include track names and URIs. No authentication tokens or full responses are recorded. Two log files are retained, up to 1 MB each.";
-    if (section == 2) return @"Select reset options, then tap Apply. Apply saves the request and closes the app immediately. Reopen Spotify to complete the reset. Metadata reset requires online resync and may discard unsynced offline changes. Playback resume reset deletes the saved queue and position without a backup. Select both metadata and playback resume resets to fix stale restored titles. Login, settings and audio files are kept; downloaded offline playback after reset is unverified.";
+    if (section == 2) return @"Select independent reset options, then tap Apply. Apply saves the request and closes the app immediately. Reopen Spotify to complete the reset. Metadata reset requires online resync and may discard unsynced offline changes. Playback resume reset deletes the saved queue and position without a backup. Select both metadata and playback resume resets to fix stale restored titles. Login, settings and audio files are kept.";
     return nil;
 }
 - (void)checkbox:(UITableViewCell *)cell selected:(BOOL)selected identifier:(NSString *)identifier {
@@ -457,12 +416,11 @@ static void JPTInstallMetadataPrompt(void) {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
     cell.textLabel.numberOfLines = 0; cell.detailTextLabel.numberOfLines = 0;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    NSDictionary *pending = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTPendingResetKey];
     if (index.section == 0) {
         cell.textLabel.text = @[@"Version", @"Network Hooks", @"Plugin Cache", @"Last Reset"][index.row];
         if (index.row == 0) cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@ · Spotify %@", kJPTBuild, kJPTBuildID, [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?"];
         if (index.row == 1) cell.detailTextLabel.text = [NSString stringWithFormat:@"Core %@ · HttpClient %@", JPTDelegateHooked(@"SPTCoreURLSessionDataDelegate") ? @"installed" : @"unavailable", JPTDelegateHooked(@"Connectivity_HttpClientKit.HttpClientURLSession") ? @"installed" : @"unavailable"];
-        if (index.row == 2) cell.detailTextLabel.text = [NSString stringWithFormat:@"Original tracks %lu · Artist names %lu", (unsigned long)JPTOriginalSnapshot().count, (unsigned long)JPTArtistNamesSnapshot().count];
+        if (index.row == 2) cell.detailTextLabel.text = JPTStorageSummary();
         if (index.row == 3) cell.detailTextLabel.text = JPTResetSummary();
     } else if (index.section == 1) {
         cell.textLabel.text = @[@"Diagnostic Logging", @"Strict Mode", @"Export Diagnostics", @"Clear Logs"][index.row];
@@ -477,26 +435,16 @@ static void JPTInstallMetadataPrompt(void) {
             [toggle addTarget:self action:@selector(strictChanged:) forControlEvents:UIControlEventValueChanged]; cell.accessoryView = toggle;
         } else cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     } else {
-        cell.textLabel.text = @[@"Reset Plugin Name Cache", @"Reset Spotify Metadata and Library Index", @"Reset Playback Resume State", @"Retry Failed Reset", @"Pending Reset", @"Cancel Pending Reset"][index.row];
+        cell.textLabel.text = @[@"Reset Plugin Cache", @"Reset Spotify Metadata and Library Index", @"Reset Playback Resume State"][index.row];
         if (index.row == 0) {
-            cell.detailTextLabel.text = @"Clear original-track lookups and learned artist names.";
+            cell.detailTextLabel.text = @"Clear stored artist names, previous metadata and in-memory lookups.";
             [self checkbox:cell selected:self.resetPlugin identifier:@"jpt.reset.plugin"];
         } else if (index.row == 1) {
-            cell.detailTextLabel.text = @"Also reset the plugin cache. Spotify must resync online.";
+            cell.detailTextLabel.text = @"Spotify must resync online. Plugin data is kept unless selected separately.";
             [self checkbox:cell selected:self.resetMetadata identifier:@"jpt.reset.metadata"];
-        } else if (index.row == 2) {
+        } else {
             cell.detailTextLabel.text = @"Delete the saved playback queue and position. No backup is created.";
             [self checkbox:cell selected:self.resetPlayback identifier:@"jpt.reset.playback"];
-        } else if (index.row == 3) {
-            if ([pending[@"failed"] boolValue]) {
-                cell.detailTextLabel.text = JPTSelectionName(pending);
-                [self checkbox:cell selected:self.retryFailed identifier:@"jpt.reset.retry"];
-            } else { cell.detailTextLabel.text = @"No failed reset"; cell.textLabel.textColor = [UIColor secondaryLabelColor]; }
-        } else if (index.row == 4) {
-            cell.detailTextLabel.text = pending ? [NSString stringWithFormat:@"%@ · %@", JPTSelectionName(pending), [pending[@"failed"] boolValue] ? @"Failed" : @"On next launch"] : @"None";
-        } else {
-            cell.selectionStyle = pending ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
-            if (!pending) cell.textLabel.textColor = [UIColor secondaryLabelColor];
         }
     }
     return cell;
@@ -513,13 +461,12 @@ static void JPTInstallMetadataPrompt(void) {
 }
 - (void)strictChanged:(UISwitch *)toggle { JPTSetStrictMode([NSUserDefaults standardUserDefaults], toggle.on); }
 - (void)apply {
-    if (!self.resetPlugin && !self.resetMetadata && !self.resetPlayback && !self.retryFailed) return;
+    if (!self.resetPlugin && !self.resetMetadata && !self.resetPlayback) return;
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *scope = self.retryFailed ? [defaults dictionaryForKey:kJPTPendingResetKey][@"scope"] : self.resetMetadata ? @"metadata" : self.resetPlugin ? @"plugin" : @"playback";
-    if (!JPTSavePendingReset(defaults, scope, self.resetPlayback, self.retryFailed)) {
-        [self message:@"Apply Failed" body:@"The reset request could not be saved. The app will stay open; please retry."]; return;
+    if (!JPTSaveResetRequest(defaults, self.resetPlugin, self.resetMetadata, self.resetPlayback)) {
+        [self message:@"Apply Failed" body:@"The reset request could not be saved. The app will stay open."]; return;
     }
-    JPTLog(@"Apply: reset %@ saved; quitting", scope);
+    JPTLog(@"Apply: selected caches saved; quitting");
     dispatch_sync(JPTLogQueue(), ^{});
     exit(EXIT_SUCCESS);
 }
@@ -550,8 +497,6 @@ static void JPTInstallMetadataPrompt(void) {
 }
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)index {
     [tableView deselectRowAtIndexPath:index animated:YES];
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSDictionary *pending = [defaults dictionaryForKey:kJPTPendingResetKey];
     if (index.section == 1 && index.row == 2) [self exportFrom:[tableView cellForRowAtIndexPath:index]];
     if (index.section == 1 && index.row == 3) {
         dispatch_async(JPTLogQueue(), ^{
@@ -561,11 +506,9 @@ static void JPTInstallMetadataPrompt(void) {
         });
     }
     if (index.section != 2) return;
-    if (index.row == 0) { self.retryFailed = NO; self.resetPlugin = !self.resetPlugin; if (!self.resetPlugin) self.resetMetadata = NO; }
-    if (index.row == 1) { self.retryFailed = NO; self.resetMetadata = !self.resetMetadata; if (self.resetMetadata) self.resetPlugin = YES; }
-    if (index.row == 2) { self.retryFailed = NO; self.resetPlayback = !self.resetPlayback; }
-    if (index.row == 3 && [pending[@"failed"] boolValue]) { self.retryFailed = !self.retryFailed; self.resetPlugin = NO; self.resetMetadata = NO; self.resetPlayback = NO; }
-    if (index.row == 5 && pending) { [defaults removeObjectForKey:kJPTPendingResetKey]; [defaults synchronize]; self.retryFailed = NO; JPTLog(@"pending reset cancelled"); }
+    if (index.row == 0) self.resetPlugin = !self.resetPlugin;
+    if (index.row == 1) self.resetMetadata = !self.resetMetadata;
+    if (index.row == 2) self.resetPlayback = !self.resetPlayback;
     [self refresh];
 }
 @end

@@ -1,9 +1,7 @@
-// Exercise the real logger and reset helpers against isolated temporary data.
+// Exercise production maintenance against isolated storage and Spotify cache fixtures.
 #define JPT_MANAGEMENT_TEST 1
 #import <Foundation/Foundation.h>
-static NSString *const kJPTArtistNamesKey = @"JPOriginalTitlesArtistNames";
 #include "../JPTManagement.m"
-
 @interface JPTUnsavedDefaults : NSObject
 @property (nonatomic, strong) NSMutableDictionary *values;
 @end
@@ -15,195 +13,117 @@ static NSString *const kJPTArtistNamesKey = @"JPOriginalTitlesArtistNames";
 - (void)removeObjectForKey:(NSString *)key { [self.values removeObjectForKey:key]; }
 - (BOOL)synchronize { return NO; }
 @end
-
 static void Check(BOOL condition, NSString *message) {
-    if (!condition) { fprintf(stderr, "FAIL: %s\n", message.UTF8String); exit(1); }
-    printf("PASS: %s\n", message.UTF8String);
+    if (!condition) { fprintf(stderr,"FAIL: %s\n",message.UTF8String); exit(1); }
+    printf("PASS: %s\n",message.UTF8String);
 }
-
-static void CreateDatabase(NSString *users, NSString *name) {
-    NSString *db = [[users stringByAppendingPathComponent:name] stringByAppendingPathComponent:@"primary.ldb"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:db withIntermediateDirectories:YES attributes:nil error:nil];
-    [@"fixture" writeToFile:[db stringByAppendingPathComponent:@"LOCK"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+static BOOL Exists(NSString *path) { return [NSFileManager.defaultManager fileExistsAtPath:path]; }
+static void CreateDatabase(NSString *users) {
+    NSString *path = [users stringByAppendingPathComponent:@"user/primary.ldb"];
+    [NSFileManager.defaultManager createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+    [@"fixture" writeToFile:[path stringByAppendingPathComponent:@"LOCK"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
-
-static BOOL Exists(NSString *path) { return [[NSFileManager defaultManager] fileExistsAtPath:path]; }
-
-int main(void) {
-    @autoreleasepool {
-        NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"jpt-management-test-" stringByAppendingString:NSUUID.UUID.UUIDString]];
-        NSString *users = [root stringByAppendingPathComponent:@"PersistentCache/Users"];
-        NSString *suite = [@"jpt.management.test." stringByAppendingString:NSUUID.UUID.UUIDString];
-        NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:suite];
-        JPTLoadStrictMode(defaults);
-        Check(!JPTStrictMode(), @"strict mode defaults off");
-        JPTSetStrictMode(defaults, YES);
-        Check(JPTStrictMode() && [defaults boolForKey:kJPTStrictKey], @"strict mode changes immediately and is persisted");
-        atomic_store(&gJPTStrict, false); JPTLoadStrictMode(defaults);
-        Check(JPTStrictMode() && [JPTStrictSummary() isEqualToString:@"Strict mode: on"], @"diagnostic export summary includes persisted strict mode");
-        JPTSetStrictMode(defaults, NO);
-        Check(!JPTStrictMode() && [JPTStrictSummary() isEqualToString:@"Strict mode: off"], @"strict mode turns off immediately");
-        Check(JPTMetadataPromptRequired(defaults), @"fresh installation offers metadata refresh");
-        Check(JPTClaimMetadataPrompt(defaults) && !JPTMetadataPromptRequired(defaults), @"recorded first prompt prevents duplicate presentation");
-        Check(JPTMetadataPromptChoice(defaults, NO) && ![defaults objectForKey:kJPTPendingResetKey], @"cancel does not schedule or clear metadata");
-        NSUserDefaults *reopened = [[NSUserDefaults alloc] initWithSuiteName:suite];
-        Check(!JPTMetadataPromptRequired(reopened) && !JPTClaimMetadataPrompt(reopened), @"cancelled prompt stays hidden after relaunch");
-        [defaults removeObjectForKey:kJPTMetadataPromptKey];
-        [defaults setObject:@{@"scope": @"playback"} forKey:kJPTPendingResetKey];
-        Check(!JPTMetadataPromptRequired(defaults) && !JPTClaimMetadataPrompt(defaults), @"pending maintenance is not overwritten by first prompt");
-        [defaults removeObjectForKey:kJPTPendingResetKey];
-        Check(JPTClaimMetadataPrompt(defaults) && JPTMetadataPromptChoice(defaults, YES), @"confirm persists the metadata reset request");
-        NSDictionary *firstReset = [defaults dictionaryForKey:kJPTPendingResetKey];
-        Check([firstReset[@"scope"] isEqual:@"metadata"] && ![firstReset[@"playback"] boolValue], @"first prompt never selects playback reset");
-        Check(!JPTMetadataPromptRequired(reopened), @"confirmed prompt also stays hidden after relaunch");
-        [defaults removeObjectForKey:kJPTPendingResetKey];
-        JPTUnsavedDefaults *unsaved = [JPTUnsavedDefaults new];
-        Check(!JPTMetadataPromptChoice((NSUserDefaults *)unsaved, YES) && ![unsaved objectForKey:kJPTPendingResetKey], @"failed confirmation leaves no reset that could persist later");
-        NSDictionary *savedPending = @{@"scope": @"plugin", @"failed": @YES};
-        [unsaved setObject:savedPending forKey:kJPTPendingResetKey];
-        Check(!JPTSavePendingReset((NSUserDefaults *)unsaved, @"metadata", NO, NO)
-              && [[unsaved objectForKey:kJPTPendingResetKey] isEqual:savedPending], @"failed save restores the previous pending reset");
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:nil];
-        setenv("JPT_TEST_LOG_PATH", [[root stringByAppendingPathComponent:@"JPOriginalTitles.log"] UTF8String], 1);
-        NSString *log = JPTLogPath();
-        [@"old log\n" writeToFile:log atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        JPTLog(@"disabled");
-        dispatch_sync(JPTLogQueue(), ^{});
-        Check([[NSString stringWithContentsOfFile:log encoding:NSUTF8StringEncoding error:nil] isEqualToString:@"old log\n"], @"disabled logging preserves existing logs");
-        atomic_store(&gJPTLogging, YES);
-        JPTLog(@"enabled");
-        dispatch_sync(JPTLogQueue(), ^{});
-        Check([[NSString stringWithContentsOfFile:log encoding:NSUTF8StringEncoding error:nil] containsString:@"enabled"], @"enabled logging appends");
-        NSString *longLine = [@"x" stringByPaddingToLength:1900 withString:@"x" startingAtIndex:0];
-        for (int i = 0; i < 1200; i++) JPTLog(@"%@", longLine);
-        dispatch_sync(JPTLogQueue(), ^{});
-        Check([[fm attributesOfItemAtPath:log error:nil][NSFileSize] unsignedIntegerValue] <= kJPTLogLimit
-              && [[fm attributesOfItemAtPath:[log stringByAppendingString:@".1"] error:nil][NSFileSize] unsignedIntegerValue] <= kJPTLogLimit,
-              @"rotation bounds both logs to 1 MB");
-        NSString *legacy = [@"legacy\n" stringByPaddingToLength:2 * kJPTLogLimit withString:@"legacy\n" startingAtIndex:0];
-        [legacy writeToFile:log atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        JPTLog(@"legacy rotation");
-        dispatch_sync(JPTLogQueue(), ^{});
-        Check([[fm attributesOfItemAtPath:[log stringByAppendingString:@".1"] error:nil][NSFileSize] unsignedIntegerValue] <= kJPTLogLimit,
-              @"oversized legacy logs are bounded when logging resumes");
-        atomic_store(&gJPTLogging, NO);
-        CreateDatabase(users, @"one-user"); CreateDatabase(users, @"two-user");
-        NSString *storage = [root stringByAppendingPathComponent:@"PersistentCache/Storage"];
-        [fm createDirectoryAtPath:storage withIntermediateDirectories:YES attributes:nil error:nil];
-        NSString *resume = [users stringByAppendingPathComponent:@"one-user/context_player_state_restore"];
-        NSData *resumeData = [@"saved playback state" dataUsingEncoding:NSUTF8StringEncoding];
-        [resumeData writeToFile:resume atomically:YES];
-        JPTProcessReset(users, defaults);
-        Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
-              && Exists([users stringByAppendingPathComponent:@"two-user/primary.ldb"])
-              && Exists(storage) && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion], @"automatic migration preserves Spotify databases and records the plugin revision");
-        Check(Exists(resume), @"plugin migration leaves playback resume state untouched");
-        [defaults setObject:@{@"scope": @"metadata", @"migration": @"6.1.3", @"failed": @YES} forKey:kJPTPendingResetKey];
-        JPTProcessReset(users, defaults);
-        Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
-              && [[[defaults dictionaryForKey:kJPTLastResetKey] objectForKey:@"scope"] isEqualToString:@"plugin"],
-              @"legacy automatic metadata reset becomes a plugin-only migration");
-        CreateDatabase(users, @"one-user");
-        JPTProcessReset(users, defaults);
-        Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]), @"same version does not repeat migration");
-        [defaults setObject:@{@"artist": @"name"} forKey:kJPTArtistNamesKey];
-        [defaults setObject:@{@"track": @"previous"} forKey:@"JPOriginalTitlesCreditsPreviousMetadataV1"];
-        [defaults setObject:@{@"scope": @"plugin"} forKey:kJPTPendingResetKey];
-        JPTProcessReset(users, defaults);
-        Check(![defaults objectForKey:kJPTArtistNamesKey] && Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
-              && ![defaults objectForKey:kJPTPendingResetKey], @"plugin-only reset keeps Spotify database");
-        Check(![defaults objectForKey:@"JPOriginalTitlesCreditsPreviousMetadataV1"], @"plugin reset clears previous metadata records");
-        Check(!JPTMetadataPromptRequired(defaults), @"plugin cache reset does not show the first prompt again");
-        int fd = open([[users stringByAppendingPathComponent:@"one-user/primary.ldb/LOCK"] fileSystemRepresentation], O_RDONLY);
-        [defaults setObject:@{@"scope": @"metadata"} forKey:kJPTPendingResetKey];
-        JPTProcessReset(users, defaults);
-        Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"failed"] boolValue]
-              && Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]), @"open database is preserved and reset reports failure");
-        close(fd);
-        JPTProcessReset(users, defaults);
-        Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]), @"failed reset waits for explicit retry");
-        NSMutableDictionary *retry = [[defaults dictionaryForKey:kJPTPendingResetKey] mutableCopy];
-        [retry removeObjectForKey:@"failed"]; [defaults setObject:retry forKey:kJPTPendingResetKey];
-        JPTProcessReset(users, defaults);
-        Check(!Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]), @"explicit retry clears the closed database");
-        CreateDatabase(users, @"one-user");
-        NSString *outside = [root stringByAppendingPathComponent:@"outside"];
-        [fm createDirectoryAtPath:outside withIntermediateDirectories:YES attributes:nil error:nil];
-        [fm createSymbolicLinkAtPath:[users stringByAppendingPathComponent:@"two-user/primary.ldb"] withDestinationPath:outside error:nil];
-        [defaults setObject:@{@"scope": @"metadata"} forKey:kJPTPendingResetKey];
-        JPTProcessReset(users, defaults);
-        Check(Exists(outside) && !Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
-              && [[defaults dictionaryForKey:kJPTPendingResetKey][@"remaining"] isEqual:@[@"two-user"]], @"partial failure preserves symlinks and records only failed targets");
-        CreateDatabase(users, @"one-user");
-        [fm removeItemAtPath:[users stringByAppendingPathComponent:@"two-user/primary.ldb"] error:nil];
-        CreateDatabase(users, @"two-user");
-        retry = [[defaults dictionaryForKey:kJPTPendingResetKey] mutableCopy];
-        [retry removeObjectForKey:@"failed"]; [defaults setObject:retry forKey:kJPTPendingResetKey];
-        JPTProcessReset(users, defaults);
-        Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
-              && !Exists([users stringByAppendingPathComponent:@"two-user/primary.ldb"]), @"partial retry does not wipe a successfully rebuilt database");
-        NSString *bad = [root stringByAppendingPathComponent:@"not-a-directory"];
-        [@"fixture" writeToFile:bad atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        [defaults setObject:@{@"scope": @"metadata"} forKey:kJPTPendingResetKey];
-        JPTProcessReset(bad, defaults);
-        Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"failed"] boolValue]
-              && ![defaults dictionaryForKey:kJPTPendingResetKey][@"remaining"], @"enumeration failure is not success and retry will re-enumerate");
-        [defaults removeObjectForKey:kJPTPendingResetKey];
-        [defaults setObject:@"6" forKey:kJPTCacheVersionKey];
-        CreateDatabase(users, @"one-user");
-        JPTProcessReset(users, defaults);
-        Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
-              && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion], @"v6 migration preserves Spotify metadata while updating plugin state");
-        Check(JPTSavePendingReset(defaults, @"metadata", NO, NO)
-              && [[defaults dictionaryForKey:kJPTPendingResetKey][@"scope"] isEqualToString:@"metadata"], @"Apply persists selected reset before exit");
-        [defaults setObject:@{@"scope": @"metadata", @"failed": @YES, @"remaining": @[@"one-user"]} forKey:kJPTPendingResetKey];
-        Check(JPTSavePendingReset(defaults, @"metadata", NO, YES)
-              && ![defaults dictionaryForKey:kJPTPendingResetKey][@"failed"]
-              && [[defaults dictionaryForKey:kJPTPendingResetKey][@"remaining"] isEqual:@[@"one-user"]], @"Apply retry retains only failed targets");
-        [defaults removeObjectForKey:kJPTPendingResetKey];
-        Check(!JPTSavePendingReset(defaults, @"metadata", NO, YES), @"Apply retry without saved request does not quit");
-        [defaults removeObjectForKey:kJPTPendingResetKey];
-        [defaults removeObjectForKey:kJPTLastResetKey];
-        [defaults setObject:@"6" forKey:kJPTCacheVersionKey];
-        JPTProcessReset([root stringByAppendingPathComponent:@"missing-users"], defaults);
-        Check(![defaults dictionaryForKey:kJPTPendingResetKey]
-              && [[defaults stringForKey:kJPTCacheVersionKey] isEqualToString:kJPTCacheVersion], @"plugin migration succeeds without a Spotify metadata directory");
-        [defaults removeObjectForKey:kJPTPendingResetKey];
-        [defaults setObject:kJPTCacheVersion forKey:kJPTCacheVersionKey];
-        CreateDatabase(users, @"one-user");
-        [fm removeItemAtPath:resume error:nil];
-        [fm createSymbolicLinkAtPath:resume withDestinationPath:outside error:nil];
-        [defaults setObject:@{@"scope": @"metadata", @"playback": @YES} forKey:kJPTPendingResetKey];
-        JPTProcessReset(users, defaults);
-        Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"failed"] boolValue]
-              && Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]) && Exists(outside),
-              @"unsafe playback-state link is preserved and prevents database deletion");
-        [fm removeItemAtPath:resume error:nil];
-        [resumeData writeToFile:resume atomically:YES];
-        [defaults setObject:@{@"artist": @"name"} forKey:kJPTArtistNamesKey];
-        Check(JPTSavePendingReset(defaults, @"playback", YES, NO), @"playback-only Apply persists the third option");
-        JPTProcessReset(users, defaults);
-        Check(!Exists(resume) && Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
-              && [defaults objectForKey:kJPTArtistNamesKey], @"playback-only reset preserves metadata and plugin caches");
-        Check([[defaults dictionaryForKey:kJPTLastResetKey][@"playbackRemoved"] unsignedIntegerValue] == 1
-              && ![defaults dictionaryForKey:kJPTLastResetKey][@"resumeBackups"], @"playback reset deletes directly without creating backup records");
-        [resumeData writeToFile:resume atomically:YES];
-        JPTSavePendingReset(defaults, @"metadata", NO, NO);
-        JPTProcessReset(users, defaults);
-        Check(Exists(resume), @"explicit metadata-only reset does not select playback implicitly");
-        CreateDatabase(users, @"one-user");
-        JPTSavePendingReset(defaults, @"metadata", YES, NO);
-        JPTProcessReset(users, defaults);
-        Check(!Exists(resume) && !Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]),
-              @"combined metadata and playback reset clears both selected caches");
-        NSArray *files = [fm contentsOfDirectoryAtPath:[users stringByAppendingPathComponent:@"one-user"] error:nil];
-        Check(!files.count, @"selected playback deletion leaves no backup file");
-        [defaults setObject:@{@"scope": @"metadata", @"playback": @YES, @"failed": @YES, @"remaining": @[@"one-user"]} forKey:kJPTPendingResetKey];
-        JPTSavePendingReset(defaults, @"metadata", NO, YES);
-        Check([[defaults dictionaryForKey:kJPTPendingResetKey][@"playback"] boolValue], @"retry retains the failed playback selection");
-        [defaults removePersistentDomainForName:suite];
-        [fm removeItemAtPath:root error:nil];
-    }
-    return 0;
+static void Seed(void) {
+    JPTMergeArtistNames(@{@"spotify:artist:a": @"Artist"});
+    JPTStorageCommit(@[@{@"uri": @"spotify:track:t", @"field": @"title", @"pair": @{@"old": @"Old", @"new": @"New", @"rank": @3}}]);
 }
+int main(void) { @autoreleasepool {
+    NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    NSString *users = [root stringByAppendingPathComponent:@"PersistentCache/Users"];
+    NSString *db = [users stringByAppendingPathComponent:@"user/primary.ldb"];
+    NSString *resume = [users stringByAppendingPathComponent:@"user/context_player_state_restore"];
+    NSString *suite = [@"jpt.management." stringByAppendingString:NSUUID.UUID.UUIDString];
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:suite];
+    setenv("JPT_TEST_DATABASE_PATH", [[root stringByAppendingPathComponent:@"JPOriginalTitles/metadata.sqlite3"] UTF8String], 1);
+    JPTLoadStrictMode(defaults); Check(!JPTStrictMode(), @"strict defaults off");
+    JPTSetStrictMode(defaults, YES); Check(JPTStrictMode(), @"strict updates immediately");
+    atomic_store(&gJPTStrict, false); JPTLoadStrictMode(defaults); Check(JPTStrictMode(), @"strict persists");
+    JPTSetStrictMode(defaults, NO); Check(!JPTStrictMode(), @"strict turns off");
+    Check(JPTMetadataPromptRequired(defaults), @"fresh version offers reset");
+    [defaults setBool:YES forKey:kJPTMetadataPromptKey]; Check(JPTMetadataPromptRequired(defaults), @"legacy boolean does not suppress new version prompt");
+    [defaults setObject:@"v7" forKey:kJPTMetadataPromptKey]; Check(JPTMetadataPromptRequired(defaults), @"older plugin version prompts again");
+    Check(JPTMetadataPromptRequired(defaults), @"no choice leaves prompt available after interruption");
+    Check(JPTMetadataPromptChoice(defaults, NO), @"cancel saves choice");
+    Check(![defaults objectForKey:kJPTResetRequestKey], @"cancel schedules no reset");
+    NSUserDefaults *reopened = [[NSUserDefaults alloc] initWithSuiteName:suite];
+    Check(!JPTMetadataPromptRequired(reopened), @"cancel persists after relaunch");
+    [defaults setObject:@"v7" forKey:kJPTMetadataPromptKey];
+    Check(JPTMetadataPromptChoice(defaults, YES), @"confirm saves request and choice");
+    NSDictionary *request = [defaults dictionaryForKey:kJPTResetRequestKey];
+    Check([request[@"metadata"] boolValue] && [request[@"plugin"] boolValue] && [request[@"playback"] boolValue], @"prompt selects all three caches including playback state");
+    Check(!JPTMetadataPromptRequired(reopened), @"same version confirm does not repeat");
+    [defaults removeObjectForKey:kJPTResetRequestKey];
+    JPTUnsavedDefaults *unsaved = [JPTUnsavedDefaults new];
+    Check(!JPTMetadataPromptChoice((id)unsaved, YES) && ![unsaved objectForKey:kJPTResetRequestKey], @"failed confirm leaves no latent reset");
+    NSDictionary *prior = @{@"plugin": @YES}; [unsaved setObject:prior forKey:kJPTResetRequestKey];
+    Check(!JPTSaveResetRequest((id)unsaved, NO, YES, NO) && [[unsaved objectForKey:kJPTResetRequestKey] isEqual:prior], @"failed save restores previous selection");
+    Check(!JPTSaveResetRequest(defaults, NO, NO, NO), @"empty selection cannot quit");
+    Seed(); CreateDatabase(users);
+    [@"queue" writeToFile:resume atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [defaults setObject:@{@"legacy":@"ignored"} forKey:@"JPOriginalTitlesArtistNames"];
+    [defaults setObject:@{@"legacy":@"ignored"} forKey:@"JPOriginalTitlesCreditsPreviousMetadataV1"];
+    [defaults setObject:@{@"scope":@"metadata",@"failed":@YES} forKey:@"JPOriginalTitlesPendingReset"];
+    JPTProcessReset(users, defaults);
+    Check(Exists(db) && Exists(resume), @"legacy reset not replayed and upgrade does not erase Spotify data");
+    Check(![defaults objectForKey:@"JPOriginalTitlesArtistNames"] && ![defaults objectForKey:@"JPOriginalTitlesCreditsPreviousMetadataV1"], @"legacy dictionaries discarded without migration");
+    Check(![defaults objectForKey:@"JPOriginalTitlesPendingReset"], @"obsolete pending state removed");
+    Check(JPTStorageLoad(NO).count == 1 && JPTStorageLoad(YES).count == 1, @"launch preserves existing SQLite data");
+    JPTSaveResetRequest(defaults, NO, YES, NO); JPTProcessReset(users, defaults);
+    Check(!Exists(db) && Exists(resume), @"Spotify-only reset clears metadata and keeps playback");
+    Check(JPTStorageLoad(NO).count == 1 && JPTStorageLoad(YES).count == 1, @"Spotify-only reset preserves both plugin tables");
+    Check(![defaults objectForKey:kJPTResetRequestKey], @"startup consumes request once");
+    Check(!JPTMetadataPromptRequired(defaults), @"metadata reset retains version prompt choice");
+    CreateDatabase(users); JPTSaveResetRequest(defaults, YES, NO, NO); JPTProcessReset(users, defaults);
+    Check(Exists(db) && Exists(resume), @"plugin-only reset preserves Spotify data");
+    Check(!JPTStorageLoad(NO).count && !JPTStorageLoad(YES).count, @"plugin reset clears both tables");
+    Check(!JPTArtistNamesSnapshot().count, @"plugin reset clears artist memory");
+    Check(!JPTMetadataPromptRequired(defaults), @"plugin reset retains version prompt choice");
+    Seed(); JPTSaveResetRequest(defaults, NO, NO, YES); JPTProcessReset(users, defaults);
+    Check(Exists(db) && !Exists(resume), @"playback-only reset preserves metadata");
+    Check(JPTStorageLoad(NO).count == 1 && JPTStorageLoad(YES).count == 1, @"playback reset preserves plugin tables");
+    [@"queue" writeToFile:resume atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    JPTSaveResetRequest(defaults, YES, YES, YES); JPTProcessReset(users, defaults);
+    Check(!Exists(db) && !Exists(resume) && !JPTStorageLoad(NO).count && !JPTStorageLoad(YES).count, @"all selected resets clear exactly selected data");
+    Check([[defaults dictionaryForKey:kJPTLastResetKey][@"date"] isKindOfClass:NSDate.class], @"reset stores absolute NSDate");
+    NSTimeZone *originalZone = NSTimeZone.defaultTimeZone;
+    NSDate *date = [NSDate dateWithTimeIntervalSince1970:0];
+    [NSTimeZone setDefaultTimeZone:[NSTimeZone timeZoneWithName:@"America/New_York"]];
+    NSString *ny = JPTLocalResetDate(date);
+    [NSTimeZone setDefaultTimeZone:[NSTimeZone timeZoneWithName:@"Asia/Tokyo"]];
+    Check(![ny isEqual:JPTLocalResetDate(date)], @"reset display follows current local timezone");
+    Check(![JPTLocalResetDate(@"2026-10-16 23:00:00 +0000") isEqual:@"Unknown time"], @"old reset timestamps are formatted locally");
+    [NSTimeZone setDefaultTimeZone:originalZone];
+    CreateDatabase(users);
+    int fd = open([[db stringByAppendingPathComponent:@"LOCK"] fileSystemRepresentation], O_RDONLY);
+    JPTSaveResetRequest(defaults, NO, YES, NO); JPTProcessReset(users, defaults);
+    Check(Exists(db) && ![[defaults dictionaryForKey:kJPTLastResetKey][@"success"] boolValue], @"open Spotify database is preserved and failure recorded");
+    close(fd); JPTProcessReset(users, defaults);
+    Check(Exists(db) && ![defaults objectForKey:kJPTResetRequestKey], @"failed request never automatically retries");
+    JPTSaveResetRequest(defaults, NO, YES, NO); JPTProcessReset(users, defaults);
+    Check(!Exists(db), @"new explicit selection clears closed cache");
+    NSString *outside = [root stringByAppendingPathComponent:@"outside"];
+    [NSFileManager.defaultManager createDirectoryAtPath:outside withIntermediateDirectories:YES attributes:nil error:nil];
+    [NSFileManager.defaultManager createSymbolicLinkAtPath:db withDestinationPath:outside error:nil];
+    JPTSaveResetRequest(defaults, NO, YES, NO); JPTProcessReset(users, defaults);
+    Check(Exists(outside) && Exists(db) && ![[defaults dictionaryForKey:kJPTLastResetKey][@"success"] boolValue], @"symlink metadata is preserved");
+    [NSFileManager.defaultManager removeItemAtPath:db error:nil]; CreateDatabase(users);
+    [NSFileManager.defaultManager createSymbolicLinkAtPath:resume withDestinationPath:outside error:nil];
+    JPTSaveResetRequest(defaults, NO, YES, YES); JPTProcessReset(users, defaults);
+    Check(Exists(resume) && Exists(db), @"unsafe playback link prevents partial deletion for that user");
+    NSString *bad = [root stringByAppendingPathComponent:@"bad"];
+    [@"file" writeToFile:bad atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    JPTSaveResetRequest(defaults, NO, YES, NO); JPTProcessReset(bad, defaults);
+    Check(![[defaults dictionaryForKey:kJPTLastResetKey][@"success"] boolValue], @"enumeration failure is recorded");
+    setenv("JPT_TEST_LOG_PATH", [[root stringByAppendingPathComponent:@"JPOriginalTitles.log"] UTF8String], 1);
+    NSString *log = JPTLogPath(); [@"old\n" writeToFile:log atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    JPTLog(@"disabled"); dispatch_sync(JPTLogQueue(), ^{});
+    Check([[NSString stringWithContentsOfFile:log encoding:NSUTF8StringEncoding error:nil] isEqual:@"old\n"], @"disabled logging leaves files alone");
+    atomic_store(&gJPTLogging, true); JPTLog(@"enabled"); dispatch_sync(JPTLogQueue(), ^{});
+    Check([[NSString stringWithContentsOfFile:log encoding:NSUTF8StringEncoding error:nil] containsString:@"enabled"], @"enabled logging appends");
+    NSString *line = [@"x" stringByPaddingToLength:1900 withString:@"x" startingAtIndex:0];
+    for (int i=0;i<1200;i++) JPTLog(@"%@",line); dispatch_sync(JPTLogQueue(), ^{});
+    Check([[NSFileManager.defaultManager attributesOfItemAtPath:log error:nil][NSFileSize] unsignedIntegerValue] <= kJPTLogLimit && [[NSFileManager.defaultManager attributesOfItemAtPath:[log stringByAppendingString:@".1"] error:nil][NSFileSize] unsignedIntegerValue] <= kJPTLogLimit, @"both logs stay bounded");
+    [defaults removePersistentDomainForName:suite];
+    sqlite3_close(gJPTStore); gJPTStore = NULL;
+    [NSFileManager.defaultManager removeItemAtPath:root error:nil];
+} return 0; }

@@ -1657,34 +1657,7 @@ static void JPTFetchAlbumOriginals(NSURLRequest *template, NSData *body, NSSet<N
 
 #pragma mark - Learned artist names and request template
 
-static NSString *const kJPTArtistNamesKey = @"JPOriginalTitlesArtistNames";
-static NSMutableDictionary<NSString *, NSString *> *gArtistNames;
 static NSMutableSet<NSString *> *gArtistChecked;
-
-static NSMutableDictionary<NSString *, NSString *> *JPTArtistNamesSnapshot(void) {
-    @synchronized (gArtistNames) {
-        return [gArtistNames mutableCopy];
-    }
-}
-
-// Keeps pairs learned from track rewrites so artist pages opened later (or after relaunch) are renamed too
-static void JPTMergeArtistNames(NSDictionary<NSString *, NSString *> *names) {
-    NSDictionary *copy = nil;
-    @synchronized (gArtistNames) {
-        NSUInteger before = gArtistNames.count;
-        BOOL changed = NO;
-        for (NSString *uri in names) {
-            if (![gArtistNames[uri] isEqualToString:names[uri]]) {
-                gArtistNames[uri] = names[uri];
-                changed = YES;
-            }
-        }
-        if (!changed) return;
-        copy = [gArtistNames copy];
-        JPTLog(@"artist names %lu -> %lu", (unsigned long)before, (unsigned long)copy.count);
-    }
-    [[NSUserDefaults standardUserDefaults] setObject:copy forKey:kJPTArtistNamesKey];
-}
 
 static void JPTFetchArtistLanguage(NSURLRequest *template, NSData *body, NSSet *uris, NSString *language,
                                    void (^done)(NSDictionary *, NSError *)) {
@@ -1696,7 +1669,7 @@ static void JPTFetchArtistOriginals(NSURLRequest *template, NSData *body, NSSet 
     if (!JPTResolutionFor(template)) template = JPTBeginResolution(template);
     NSError *stopped = JPTStopped(template); if (stopped) { done(stopped); return; }
     NSMutableSet *missing = [NSMutableSet set];
-    @synchronized (gArtistNames) {
+    @synchronized (JPTStorageLock()) {
         for (NSString *uri in uris) if (!gArtistNames[uri] && ![gArtistChecked containsObject:uri]) [missing addObject:uri];
     }
     if (!missing.count) { done(nil); return; }
@@ -1712,7 +1685,7 @@ static void JPTFetchArtistOriginals(NSURLRequest *template, NSData *body, NSSet 
         if (!japanese.count) { done(zhError); return; }
         JPTFetchArtistLanguage(template, body, japanese, @"ja", ^(NSDictionary *ja, NSError *error) {
             NSMutableDictionary *names = [NSMutableDictionary dictionary];
-            @synchronized (gArtistNames) {
+            @synchronized (JPTStorageLock()) {
                 for (NSString *uri in japanese) {
                     if (!ja[uri]) continue;
                     [gArtistChecked addObject:uri];
@@ -1727,7 +1700,7 @@ static void JPTFetchArtistOriginals(NSURLRequest *template, NSData *body, NSSet 
 }
 
 static BOOL JPTKnowsAnyArtist(NSSet<NSString *> *uris) {
-    @synchronized (gArtistNames) {
+    @synchronized (JPTStorageLock()) {
         for (NSString *uri in uris) {
             if (gArtistNames[uri]) return YES;
         }
@@ -1918,8 +1891,8 @@ static void JPTFinishSearch(NSURLSession *session, NSURLRequest *searchRequest, 
                (unsigned long)changes.count);
         for (NSString *change in changes) JPTLog(@"  %@", change);
         // Capture only the payload actually delivered to the client.
-        JPTCapturePreviousSearch(payload, patched ?: payload);
-        deliver(patched ?: payload, nil);
+        if (JPTCapturePreviousSearch(payload, patched ?: payload)) deliver(patched ?: payload, nil);
+        else deliver(nil, [NSError errorWithDomain:@"JPOriginalTitles.Storage" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Could not persist name changes"}]);
     };
     NSURLRequest *template = nil;
     NSData *templateBody = nil;
@@ -2089,7 +2062,8 @@ static void JPTHookDelegate(NSString *name) {
             NSError *failure = !patched || (JPTStrictMode() && !JPTClientMetadataIsValid(payload))
                 ? JPTLookupFailureError(JPTLookupParseFailure, @"Metadata rewrite parse failure") : nil;
             if (JPTBlockDelivery(failure, state.traitTracks)) deliver(nil, failure);
-            else { JPTCapturePreviousResponse(payload, patched ?: payload); deliver(patched ?: payload, nil); }
+            else if (JPTCapturePreviousResponse(payload, patched ?: payload)) deliver(patched ?: payload, nil);
+            else deliver(nil, [NSError errorWithDomain:@"JPOriginalTitles.Storage" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Could not persist name changes"}]);
         };
         NSSet<NSString *> *missing = tracks ? JPTMissingOriginals(tracks, state.traitTracks, originals(), !clientOriginal) : nil;
         // Deliver later on the delegate queue once original-name metadata is fetched
@@ -2123,8 +2097,7 @@ static void JPTHookDelegate(NSString *name) {
 static void JPTInitializeNetwork(void) {
     @autoreleasepool {
         gOriginalCache = [NSMutableDictionary dictionary];
-        NSDictionary *saved = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kJPTArtistNamesKey];
-        gArtistNames = saved ? [saved mutableCopy] : [NSMutableDictionary dictionary];
+        JPTArtistNamesSnapshot();
         gArtistChecked = [NSMutableSet set];
         gDelegateClasses = [NSMutableArray array];
         // Native core requests use SPTCoreURLSessionDataDelegate; Swift clients use HttpClientURLSession

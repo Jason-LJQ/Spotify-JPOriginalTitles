@@ -123,6 +123,15 @@ int main(int argc, const char *argv[]) {
         NSData *empty = [NSData data];
         Finish(empty, &data, &error);
         Check(!error, @"search without tracks completes without an error");
+        JPTStorageClear(); gJPTPreviousMetadataRecords = nil;
+        gTemplateRequest = nil; gOriginalCache = [@{own:Track(@"Kyuseishu",original),original:Track(@"救世主",nil)} mutableCopy];
+        JPTStorageExec("CREATE TRIGGER delivery_failure BEFORE INSERT ON previous_fields BEGIN SELECT RAISE(ABORT,'fixture'); END");
+        Finish(romanized, &data, &error);
+        Check(!data.length && [error.domain isEqual:@"JPOriginalTitles.Storage"], @"storage failure blocks rewritten search delivery even in default mode");
+        Check(!JPTPreviousFields(own).count, @"failed search delivery does not publish previous fields");
+        JPTStorageExec("DROP TRIGGER delivery_failure");
+        Finish(romanized, &data, &error);
+        Check(!error && [SearchName(data) isEqual:@"救世主"] && [JPTPreviousFields(own)[@"title"] isEqual:@"Kyuseishu"], @"successful search delivery has durable previous fields before callback");
         printf("%lu checks passed\n", (unsigned long)checks);
     }
     return 0;
