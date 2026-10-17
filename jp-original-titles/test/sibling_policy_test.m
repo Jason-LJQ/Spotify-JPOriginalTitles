@@ -33,5 +33,15 @@ int main(void) { @autoreleasepool {
     Check(![JPTSiblingSourceAlbums(all,uris) containsObject:@"spotify:album:0000000000000000000000"],@"explicit English language does not enter sibling discovery");
     [all[first] setPerformanceLanguages:nil];
     Check([JPTSiblingSourceAlbums(all,uris) containsObject:@"spotify:album:0000000000000000000000"],@"a missing language still enters sibling discovery");
+    JPTTrackInfo *own=all[first], *target=[JPTTrackInfo new];target.name=@"Latin target";
+    own.canonicalURI=@"spotify:track:shared-target";all[own.canonicalURI]=target;
+    NSString *source=@"spotify:album:0000000000000000000000";
+    Check([JPTSiblingSourceAlbums(all,uris) containsObject:source],@"resolved Roman canonical enters sibling discovery");
+    [all removeObjectForKey:own.canonicalURI];
+    Check(![JPTSiblingSourceAlbums(all,uris) containsObject:source],@"missing non-self canonical does not enter sibling discovery");
+    all[own.canonicalURI]=target;target.name=@"原文";
+    Check(![JPTSiblingSourceAlbums(all,uris) containsObject:source],@"resolved CJK canonical does not enter sibling discovery");
+    target.name=@"Latin target";own.performanceLanguages=@[@"en"];
+    Check(![JPTSiblingSourceAlbums(all,uris) containsObject:source],@"Roman canonical does not bypass the English language gate");
     printf("%lu checks passed\n",(unsigned long)checks);
 }return 0;}

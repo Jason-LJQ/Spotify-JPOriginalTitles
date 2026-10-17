@@ -688,9 +688,18 @@ static JPTTrackInfo *JPTAlbumOriginal(JPTTrackInfo *own, NSDictionary<NSString *
         && match.number == own.number && match.disc == own.disc ? match : nil;
 }
 
+// A resolved non-CJK canonical still leaves the track to the indirect paths.
+static BOOL JPTCanonicalUnresolved(NSString *uri, JPTTrackInfo *own, NSDictionary *all) {
+    if (!own.canonicalURI.length || [own.canonicalURI isEqualToString:uri]) return YES;
+    JPTTrackInfo *target = all[own.canonicalURI];
+    return target && !JPTHasCJK(target.name);
+}
+
 static JPTTrackInfo *JPTIndirectOriginal(NSString *uri, JPTTrackInfo *own, NSDictionary *all) {
     if (JPTHasCJK(own.name) || !own.isrc.length || !own.duration || !own.number || !own.disc
-        || (own.canonicalURI.length && ![own.canonicalURI isEqualToString:uri])) return nil;
+        || !JPTCanonicalUnresolved(uri, own, all)) return nil;
+    // Candidates link to the source itself, or to the canonical they share with it.
+    NSString *link = own.canonicalURI.length ? own.canonicalURI : uri;
     NSMutableSet *albums = [NSMutableSet set];
     for (NSString *candidateURI in JPTReverseCandidates(uri)) {
         JPTTrackInfo *candidate = all[candidateURI];
@@ -717,7 +726,7 @@ static JPTTrackInfo *JPTIndirectOriginal(NSString *uri, JPTTrackInfo *own, NSDic
         }
         if (count != 1 || !JPTHasCJK(candidate.name) || candidate.duration != own.duration
             || candidate.disc != own.disc || candidate.number != own.number
-            || ![candidate.canonicalURI isEqualToString:uri]) continue;
+            || ![candidate.canonicalURI isEqualToString:link]) continue;
         if (match && match != candidate) return nil;
         match = candidate;
     }
@@ -1604,7 +1613,7 @@ static NSSet<NSString *> *JPTSiblingSourceAlbums(NSDictionary *snapshot, NSSet<N
     for (NSString *uri in uris) {
         JPTTrackInfo *own = snapshot[uri]; JPTAlbumInfo *album = snapshot[own.albumURI];
         if (!own || JPTHasCJK(own.name) || !own.isrc.length || JPTAlbumOriginal(own, snapshot)
-            || (own.canonicalURI.length && ![own.canonicalURI isEqualToString:uri]) || !JPTAllowsSiblingLookup(own)) continue;
+            || !JPTCanonicalUnresolved(uri, own, snapshot) || !JPTAllowsSiblingLookup(own)) continue;
         if ([album isKindOfClass:[JPTAlbumInfo class]]
             && (!album.canonicalURI.length || [album.canonicalURI isEqualToString:own.albumURI])) [eligible addObject:own.albumURI];
     }
@@ -1622,7 +1631,7 @@ static void JPTFetchAlbumOriginals(NSURLRequest *template, NSData *body, NSSet<N
         for (NSString *uri in uris) {
             JPTTrackInfo *own = initial[uri]; JPTAlbumInfo *album = initial[own.albumURI];
             if (!own || JPTHasCJK(own.name) || !own.isrc.length || JPTAlbumOriginal(own, initial)
-                || (own.canonicalURI.length && ![own.canonicalURI isEqualToString:uri])) continue;
+                || !JPTCanonicalUnresolved(uri, own, initial)) continue;
             [needed unionSet:JPTReverseCandidates(uri)];
             if ([sourceAlbums containsObject:own.albumURI]) [needed unionSet:album.trackURIs];
         }

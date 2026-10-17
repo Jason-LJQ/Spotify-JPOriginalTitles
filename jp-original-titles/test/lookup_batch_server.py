@@ -34,6 +34,32 @@ for path in fixtures.glob('JPTPath-*-lookup-response.bin'):
 # The original client response supplies IdentityTrait for the delegate test.
 for path in fixtures.glob('JPTPath-*-server-response.bin'):
     collect(path.read_bytes())
+# Fully synthetic catalog for the single-track shared-canonical cold chain.
+def shared_uri(kind, value):
+    alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    encoded = ''
+    number = value
+    while number:
+        encoded = alphabet[number % 62] + encoded
+        number //= 62
+    return f'spotify:{kind}:{encoded.zfill(22)}'
+
+for i in range(1, 6):
+    for original in [False, True]:
+        uri = shared_uri('track', 10 + i if original else i)
+        album = shared_uri('album', 102 if original else 101)
+        canonical = shared_uri('track', 6 if i <= 3 else (i if original else 10 + i))
+        name = f'日本語 {i}' if original else 'Latin title'
+        album_name = '日本語 EP' if original else 'Latin EP'
+        album_value = ld(1, (102 if original else 101).to_bytes(16, 'big')) + ld(2, album_name.encode())
+        catalog[(10, uri)] = (ld(2, name.encode()) + ld(3, album_value) + vi(5, i) + vi(6, 1)
+                              + vi(7, 200000 + i) + ld(10, ld(1, b'isrc') + ld(2, f'RECORDING{i}'.encode()))
+                              + ld(22, b'ja') + ld(36, canonical.encode()))
+catalog[(10, shared_uri('track', 6))] = ld(2, b'Latin canonical') + ld(3, ld(1, (103).to_bytes(16, 'big')))
+for value, name, values in [(101, 'Latin EP', range(1, 6)), (102, '日本語 EP', range(11, 16)), (103, 'Other release', [])]:
+    catalog[(9, shared_uri('album', value))] = (ld(2, name.encode()) + ld(35, shared_uri('album', value).encode())
+        + ld(11, b''.join(ld(3, ld(1, i.to_bytes(16, 'big'))) for i in values)))
+
 records = []
 lock = threading.Lock()
 active = maximum_active = 0

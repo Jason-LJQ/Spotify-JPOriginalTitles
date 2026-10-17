@@ -1,6 +1,7 @@
 // Exercise real asynchronous batching and delegate delivery against a local fixture server.
 #define JPT_MANAGEMENT_TEST 1
 #include "../JPOriginalTitles.m"
+#include "shared_canonical_fixture.h"
 static NSUInteger checks;
 static void Check(BOOL value, NSString *label) {
     if (!value) { fprintf(stderr,"FAIL %s\n",label.UTF8String); exit(1); }
@@ -95,6 +96,24 @@ int main(int argc,const char *argv[]) {
         dispatch_group_t group=dispatch_group_create();__block NSUInteger failed=0;
         for(NSUInteger i=0;i<9;i++) { dispatch_group_enter(group);JPTFetchOriginals(request,body,[NSSet setWithObject:target],^(NSError *error){if(error){@synchronized(gOriginalCache){failed++;}}dispatch_group_leave(group);}); }
         Check(dispatch_group_wait(group,dispatch_time(DISPATCH_TIME_NOW,20*NSEC_PER_SEC))==0 && !failed,@"parallel lookup jobs all finish under the shared concurrency bound");
+        // Start with no cached metadata and request only the first source track.
+        request.URL=[NSURL URLWithString:[base stringByAppendingString:@"/shared-canonical"]];
+        gOriginalCache=[NSMutableDictionary dictionary];gReverseOriginals=[NSMutableDictionary dictionary];
+        NSSet *one=[NSSet setWithObject:SharedURI(@"track",1)];
+        dispatch_semaphore_t sharedReady=dispatch_semaphore_create(0);__block NSError *sharedError=nil;
+        JPTFetchOriginals(request,body,one,^(NSError *error){
+            if (error) { sharedError=error;dispatch_semaphore_signal(sharedReady);return; }
+            NSDictionary *snapshot=JPTOriginalSnapshot();NSSet *links=JPTMissingOriginals(snapshot,one,snapshot,NO);
+            JPTFetchOriginals(request,body,links,^(NSError *canonicalError){
+                if (canonicalError) { sharedError=canonicalError;dispatch_semaphore_signal(sharedReady);return; }
+                JPTFetchAlbumOriginals(request,body,one,^(NSError *albumError){sharedError=albumError;dispatch_semaphore_signal(sharedReady);});
+            });
+        });
+        BOOL completed=dispatch_semaphore_wait(sharedReady,dispatch_time(DISPATCH_TIME_NOW,45*NSEC_PER_SEC))==0;
+        NSDictionary *snapshot=JPTOriginalSnapshot();JPTTrackInfo *resolved=JPTPreferredInfo(SharedURI(@"track",1),snapshot,snapshot);
+        Check(completed && !sharedError && [resolved.name isEqual:@"日本語 1"]
+            && [resolved.albumName isEqual:@"日本語 EP"] && [resolved.albumURI isEqual:SharedURI(@"album",102)],
+            @"single cold request discovers sibling canonicals and the complete original EP asynchronously");
         JPTStorageClear();
         printf("%lu checks passed\n",(unsigned long)checks);
     }return 0;

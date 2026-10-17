@@ -1,6 +1,7 @@
 // Verify reverse and sibling candidates against live catalog fixtures and adverse variants.
 #define JPT_MANAGEMENT_TEST 1
 #include "../JPOriginalTitles.m"
+#include "shared_canonical_fixture.h"
 static NSUInteger checks;
 static void Check(BOOL value, NSString *label) {
     if (!value) { fprintf(stderr,"FAIL %s\n",label.UTF8String); exit(1); }
@@ -63,5 +64,41 @@ int main(int argc,const char *argv[]) { @autoreleasepool {
     values=[JPTCollectMetadata(mixed) mutableCopy];
     Check(JPTValidateLookup(mixed,[NSSet setWithArray:@[empty,@"spotify:track:bad"]],values,NO)!=nil,@"report failed entry within a mixed response");
     Check(values.count==1 && values[empty]!=nil,@"keep valid partial data and exclude the failed entry");
+    NSMutableDictionary *shared=SharedCatalog();gReverseOriginals=[NSMutableDictionary dictionary];
+    NSString *a=SharedURI(@"track",1), *b=SharedURI(@"track",11), *c=SharedURI(@"track",6);
+    JPTTrackInfo *sharedOwn=shared[a], *sharedMatch=shared[b], *sharedTarget=shared[c];
+    Check(JPTIndirectOriginal(a,sharedOwn,shared)==sharedMatch,@"shared Roman canonical selects the unique original recording");
+    [shared removeObjectForKey:c];
+    Check(!JPTIndirectOriginal(a,sharedOwn,shared),@"missing canonical target cannot enter the indirect path");shared[c]=sharedTarget;
+    sharedTarget.name=@"原文";
+    Check(!JPTIndirectOriginal(a,sharedOwn,shared),@"CJK canonical target stays on the direct path");sharedTarget.name=@"Latin canonical";
+    sharedMatch.canonicalURI=SharedURI(@"track",99);
+    Check(!JPTIndirectOriginal(a,sharedOwn,shared),@"unrelated candidate canonical is rejected");sharedMatch.canonicalURI=c;
+    sharedMatch.isrc=@"ANOTHER_RECORDING";
+    Check(!JPTIndirectOriginal(a,sharedOwn,shared),@"shared canonical never crosses a different ISRC");sharedMatch.isrc=sharedOwn.isrc;
+    sharedMatch.duration++;BOOL durationRejected=!JPTIndirectOriginal(a,sharedOwn,shared);sharedMatch.duration--;
+    sharedMatch.number++;BOOL positionRejected=!JPTIndirectOriginal(a,sharedOwn,shared);sharedMatch.number--;
+    Check(durationRejected && positionRejected,@"same ISRC with a different duration or position is rejected");
+    JPTTrackInfo *second=JPTNamedArtists(sharedMatch,@{});second.albumURI=SharedURI(@"album",104);
+    JPTAlbumInfo *secondAlbum=[JPTAlbumInfo new];secondAlbum.trackURIs=[NSSet setWithObject:SharedURI(@"track",21)];
+    shared[second.albumURI]=secondAlbum;shared[SharedURI(@"track",21)]=second;
+    [shared[SharedURI(@"track",15)] setAlbumURI:second.albumURI];
+    Check(!JPTIndirectOriginal(a,sharedOwn,shared),@"two complete albums with distinct eligible candidates are ambiguous");
+    [shared[SharedURI(@"track",15)] setAlbumURI:SharedURI(@"album",102)];
+    BOOL legacy=YES;
+    for (NSString *link in @[a,@""]) {
+        sharedOwn.canonicalURI=link;sharedMatch.canonicalURI=c;
+        legacy=legacy && !JPTIndirectOriginal(a,sharedOwn,shared);sharedMatch.canonicalURI=a;
+        legacy=legacy && JPTIndirectOriginal(a,sharedOwn,shared)==sharedMatch;
+    }
+    Check(legacy,@"self and empty canonical still require a candidate backlink to the source");
+    shared=SharedCatalog();BOOL five=YES;
+    for (NSUInteger i=1;i<=5;i++) {
+        NSString *u=SharedURI(@"track",i);JPTTrackInfo *expected=shared[SharedURI(@"track",10+i)];
+        JPTTrackInfo *selected=JPTSelectedOriginal(u,shared[u],shared,shared), *result=JPTPreferredInfo(u,shared,shared);
+        five=five && selected==expected && [result.name isEqual:expected.name]
+            && [result.albumName isEqual:@"日本語 EP"] && [result.albumURI isEqual:SharedURI(@"album",102)];
+    }
+    Check(five,@"all five release tracks retain their indirect or direct result and adopt the original EP");
     printf("%lu checks passed\n",(unsigned long)checks);
 }return 0;}
