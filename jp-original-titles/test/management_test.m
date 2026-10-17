@@ -4,6 +4,18 @@
 static NSString *const kJPTArtistNamesKey = @"JPOriginalTitlesArtistNames";
 #include "../JPTManagement.m"
 
+@interface JPTUnsavedDefaults : NSObject
+@property (nonatomic, strong) NSMutableDictionary *values;
+@end
+@implementation JPTUnsavedDefaults
+- (instancetype)init { if ((self = [super init])) _values = [NSMutableDictionary dictionary]; return self; }
+- (id)objectForKey:(NSString *)key { return self.values[key]; }
+- (NSDictionary *)dictionaryForKey:(NSString *)key { return self.values[key]; }
+- (void)setObject:(id)value forKey:(NSString *)key { self.values[key] = value; }
+- (void)removeObjectForKey:(NSString *)key { [self.values removeObjectForKey:key]; }
+- (BOOL)synchronize { return NO; }
+@end
+
 static void Check(BOOL condition, NSString *message) {
     if (!condition) { fprintf(stderr, "FAIL: %s\n", message.UTF8String); exit(1); }
     printf("PASS: %s\n", message.UTF8String);
@@ -31,6 +43,26 @@ int main(void) {
         Check(JPTStrictMode() && [JPTStrictSummary() isEqualToString:@"Strict mode: on"], @"diagnostic export summary includes persisted strict mode");
         JPTSetStrictMode(defaults, NO);
         Check(!JPTStrictMode() && [JPTStrictSummary() isEqualToString:@"Strict mode: off"], @"strict mode turns off immediately");
+        Check(JPTMetadataPromptRequired(defaults), @"fresh installation offers metadata refresh");
+        Check(JPTClaimMetadataPrompt(defaults) && !JPTMetadataPromptRequired(defaults), @"recorded first prompt prevents duplicate presentation");
+        Check(JPTMetadataPromptChoice(defaults, NO) && ![defaults objectForKey:kJPTPendingResetKey], @"cancel does not schedule or clear metadata");
+        NSUserDefaults *reopened = [[NSUserDefaults alloc] initWithSuiteName:suite];
+        Check(!JPTMetadataPromptRequired(reopened) && !JPTClaimMetadataPrompt(reopened), @"cancelled prompt stays hidden after relaunch");
+        [defaults removeObjectForKey:kJPTMetadataPromptKey];
+        [defaults setObject:@{@"scope": @"playback"} forKey:kJPTPendingResetKey];
+        Check(!JPTMetadataPromptRequired(defaults) && !JPTClaimMetadataPrompt(defaults), @"pending maintenance is not overwritten by first prompt");
+        [defaults removeObjectForKey:kJPTPendingResetKey];
+        Check(JPTClaimMetadataPrompt(defaults) && JPTMetadataPromptChoice(defaults, YES), @"confirm persists the metadata reset request");
+        NSDictionary *firstReset = [defaults dictionaryForKey:kJPTPendingResetKey];
+        Check([firstReset[@"scope"] isEqual:@"metadata"] && ![firstReset[@"playback"] boolValue], @"first prompt never selects playback reset");
+        Check(!JPTMetadataPromptRequired(reopened), @"confirmed prompt also stays hidden after relaunch");
+        [defaults removeObjectForKey:kJPTPendingResetKey];
+        JPTUnsavedDefaults *unsaved = [JPTUnsavedDefaults new];
+        Check(!JPTMetadataPromptChoice((NSUserDefaults *)unsaved, YES) && ![unsaved objectForKey:kJPTPendingResetKey], @"failed confirmation leaves no reset that could persist later");
+        NSDictionary *savedPending = @{@"scope": @"plugin", @"failed": @YES};
+        [unsaved setObject:savedPending forKey:kJPTPendingResetKey];
+        Check(!JPTSavePendingReset((NSUserDefaults *)unsaved, @"metadata", NO, NO)
+              && [[unsaved objectForKey:kJPTPendingResetKey] isEqual:savedPending], @"failed save restores the previous pending reset");
         NSFileManager *fm = [NSFileManager defaultManager];
         [fm createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:nil];
         setenv("JPT_TEST_LOG_PATH", [[root stringByAppendingPathComponent:@"JPOriginalTitles.log"] UTF8String], 1);
@@ -76,10 +108,13 @@ int main(void) {
         JPTProcessReset(users, defaults);
         Check(Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"]), @"same version does not repeat migration");
         [defaults setObject:@{@"artist": @"name"} forKey:kJPTArtistNamesKey];
+        [defaults setObject:@{@"track": @"previous"} forKey:@"JPOriginalTitlesCreditsPreviousMetadataV1"];
         [defaults setObject:@{@"scope": @"plugin"} forKey:kJPTPendingResetKey];
         JPTProcessReset(users, defaults);
         Check(![defaults objectForKey:kJPTArtistNamesKey] && Exists([users stringByAppendingPathComponent:@"one-user/primary.ldb"])
               && ![defaults objectForKey:kJPTPendingResetKey], @"plugin-only reset keeps Spotify database");
+        Check(![defaults objectForKey:@"JPOriginalTitlesCreditsPreviousMetadataV1"], @"plugin reset clears previous metadata records");
+        Check(!JPTMetadataPromptRequired(defaults), @"plugin cache reset does not show the first prompt again");
         int fd = open([[users stringByAppendingPathComponent:@"one-user/primary.ldb/LOCK"] fileSystemRepresentation], O_RDONLY);
         [defaults setObject:@{@"scope": @"metadata"} forKey:kJPTPendingResetKey];
         JPTProcessReset(users, defaults);

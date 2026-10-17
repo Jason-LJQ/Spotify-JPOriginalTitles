@@ -13,8 +13,9 @@ static NSString *const kJPTCacheVersionKey = @"JPOriginalTitlesCacheVersion";
 static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
 static NSString *const kJPTPendingResetKey = @"JPOriginalTitlesPendingReset";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
-static NSString *const kJPTBuild = @"v6.3.3";
-static NSString *const kJPTBuildID = @"20261016-empty-partial-fixes";
+static NSString *const kJPTMetadataPromptKey = @"JPOriginalTitlesMetadataPromptOffered";
+static NSString *const kJPTBuild = @"v7";
+static NSString *const kJPTBuildID = @"20261016-previous-metadata-no-eviction";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
 static atomic_bool gJPTStrict;
@@ -137,6 +138,7 @@ static NSString *JPTDiagnosticSummary(void) {
     [lines addObject:[NSString stringWithFormat:@"Logging: %@", atomic_load(&gJPTLogging) ? @"on" : @"off"]];
     [lines addObject:[NSString stringWithFormat:@"Original cache: %lu; artist names: %lu", (unsigned long)JPTOriginalSnapshot().count,
                       (unsigned long)JPTArtistNamesSnapshot().count]];
+    [lines addObject:[NSString stringWithFormat:@"Previous metadata records: %lu", (unsigned long)JPTPreviousRecordCount()]];
     NSString *users = JPTUsersPath();
     [lines addObject:[@"Metadata directory: " stringByAppendingString:users ?: @"unavailable"]];
     [lines addObject:[@"Foundation home: " stringByAppendingString:NSHomeDirectory() ?: @"unavailable"]];
@@ -258,7 +260,10 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
             }
         }
     }
-    if (![scope isEqualToString:@"playback"]) [defaults removeObjectForKey:kJPTArtistNamesKey];
+    if (![scope isEqualToString:@"playback"]) {
+        [defaults removeObjectForKey:kJPTArtistNamesKey];
+        [defaults removeObjectForKey:@"JPOriginalTitlesCreditsPreviousMetadataV1"];
+    }
     BOOL ok = errors.count == 0;
     NSMutableDictionary *result = [@{@"scope": scope ?: @"plugin", @"date": [NSDate date].description,
         @"success": @(ok), @"removed": @(removed), @"databaseOpen": @(open), @"errors": errors} mutableCopy];
@@ -284,16 +289,129 @@ static void JPTProcessReset(NSString *users, NSUserDefaults *defaults) {
 
 // Persist before quitting; retries retain only the targets that previously failed.
 static BOOL JPTSavePendingReset(NSUserDefaults *defaults, NSString *scope, BOOL playback, BOOL retry) {
+    id previous = [defaults objectForKey:kJPTPendingResetKey];
     NSMutableDictionary *pending = retry ? [[defaults dictionaryForKey:kJPTPendingResetKey] mutableCopy] : [NSMutableDictionary dictionary];
     if (!pending) return NO;
     pending[@"scope"] = scope;
     if (!retry) pending[@"playback"] = @(playback);
     [pending removeObjectForKey:@"failed"];
     [defaults setObject:pending forKey:kJPTPendingResetKey];
+    if ([defaults synchronize]) return YES;
+    if (previous) [defaults setObject:previous forKey:kJPTPendingResetKey];
+    else [defaults removeObjectForKey:kJPTPendingResetKey];
+    [defaults synchronize];
+    return NO;
+}
+
+static BOOL JPTMetadataPromptRequired(NSUserDefaults *defaults) {
+    return ![defaults boolForKey:kJPTMetadataPromptKey] && ![defaults objectForKey:kJPTPendingResetKey];
+}
+
+static BOOL JPTClaimMetadataPrompt(NSUserDefaults *defaults) {
+    if (!JPTMetadataPromptRequired(defaults)) return NO;
+    [defaults setBool:YES forKey:kJPTMetadataPromptKey];
     return [defaults synchronize];
 }
 
+static BOOL JPTMetadataPromptChoice(NSUserDefaults *defaults, BOOL confirm) {
+    return !confirm || JPTSavePendingReset(defaults, @"metadata", NO, NO);
+}
+
 #ifndef JPT_MANAGEMENT_TEST
+static BOOL gJPTMetadataPromptScheduled;
+static BOOL gJPTMetadataPromptPresenting;
+
+static UIViewController *JPTActivePresenter(void) {
+    UIViewController *host = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive || ![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows)
+            if (window.isKeyWindow && !window.hidden) { host = window.rootViewController; break; }
+        if (host) break;
+    }
+    while (host) {
+        NSString *name = NSStringFromClass(host.class);
+        if ([name containsString:@"Bluetooth"] && ([name containsString:@"Onboarding"]
+            || [name containsString:@"Tutorial"] || [name containsString:@"Acquisition"])) return nil;
+        if (host.presentedViewController && !host.presentedViewController.isBeingDismissed) host = host.presentedViewController;
+        else if ([host isKindOfClass:UINavigationController.class]) host = ((UINavigationController *)host).visibleViewController;
+        else if ([host isKindOfClass:UITabBarController.class]) host = ((UITabBarController *)host).selectedViewController;
+        else {
+            UIViewController *visible = nil;
+            for (UIViewController *child in host.childViewControllers.reverseObjectEnumerator) {
+                if (child.isViewLoaded && child.view.window && !child.view.hidden && child.view.alpha > 0) {
+                    CGRect rect = [child.view convertRect:child.view.bounds toView:nil], screen = child.view.window.bounds;
+                    UIView *hit = [child.view.window hitTest:CGPointMake(screen.size.width / 2, screen.size.height / 2) withEvent:nil];
+                    if (rect.size.width > 0 && rect.size.height > 0 && rect.origin.x < screen.size.width
+                        && rect.origin.y < screen.size.height && rect.origin.x + rect.size.width > 0
+                        && rect.origin.y + rect.size.height > 0 && [hit isDescendantOfView:child.view]) { visible = child; break; }
+                }
+            }
+            if (!visible) break;
+            host = visible;
+        }
+    }
+    return host.isViewLoaded && host.view.window && host.view.bounds.size.width >= 300
+        && host.view.bounds.size.height >= 300 && !host.isBeingDismissed && !host.isBeingPresented ? host : nil;
+}
+
+static void JPTScheduleMetadataPrompt(void) {
+    if (gJPTMetadataPromptScheduled || gJPTMetadataPromptPresenting || !JPTMetadataPromptRequired(NSUserDefaults.standardUserDefaults)) return;
+    gJPTMetadataPromptScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gJPTMetadataPromptScheduled = NO;
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        if (!JPTMetadataPromptRequired(defaults) || UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+        UIViewController *host = JPTActivePresenter();
+        if (!host || [host isKindOfClass:UIAlertController.class]) {
+            JPTScheduleMetadataPrompt();
+            return;
+        }
+        JPTLog(@"first-launch prompt presenter %@ bounds %@ window %@", NSStringFromClass(host.class),
+               NSStringFromCGRect(host.view.bounds), NSStringFromCGRect(host.view.window.bounds));
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Refresh Spotify Metadata?"
+            message:@"Clear cached Spotify metadata to improve original-name accuracy and collect previous names for Credits?\n\nSpotify will close. Reopen it to refresh metadata and resync the library online. Login, audio files and playback resume state are kept."
+            preferredStyle:UIAlertControllerStyleAlert];
+        __weak UIAlertController *weakAlert = alert;
+        [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+            JPTClaimMetadataPrompt(defaults);
+            JPTMetadataPromptChoice(defaults, NO);
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Confirm" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            JPTClaimMetadataPrompt(defaults);
+            if (!JPTMetadataPromptChoice(defaults, YES)) {
+                UIAlertController *error = [UIAlertController alertControllerWithTitle:@"Reset Not Saved"
+                    message:@"Spotify will stay open. You can retry from Settings and privacy → Original Titles."
+                    preferredStyle:UIAlertControllerStyleAlert];
+                [error addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [weakAlert dismissViewControllerAnimated:YES completion:^{ [host presentViewController:error animated:YES completion:nil]; }];
+                return;
+            }
+            JPTLog(@"first-launch metadata reset saved; quitting");
+            dispatch_sync(JPTLogQueue(), ^{});
+            exit(EXIT_SUCCESS);
+        }]];
+        gJPTMetadataPromptPresenting = YES;
+        void (^verify)(void) = ^{
+            gJPTMetadataPromptPresenting = NO;
+            if (alert.presentingViewController && alert.isViewLoaded && alert.view.window) JPTClaimMetadataPrompt(defaults);
+            else JPTScheduleMetadataPrompt();
+        };
+        [host presentViewController:alert animated:YES completion:verify];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            if (gJPTMetadataPromptPresenting) verify();
+        });
+    });
+}
+
+static void JPTInstallMetadataPrompt(void) {
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ JPTScheduleMetadataPrompt(); });
+        }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ JPTScheduleMetadataPrompt(); });
+}
+
 @interface JPTManagementController : UITableViewController
 @property (nonatomic) BOOL resetPlugin;
 @property (nonatomic) BOOL resetMetadata;
@@ -562,7 +680,7 @@ __attribute__((constructor)) static void JPTInit(void) {
         atomic_store(&gJPTLogging, [[NSUserDefaults standardUserDefaults] boolForKey:kJPTLoggingKey]);
         JPTLoadStrictMode([NSUserDefaults standardUserDefaults]);
         JPTProcessReset(JPTUsersPath(), [NSUserDefaults standardUserDefaults]);
-        JPTInitializeNetwork(); JPTInstallManagementHook();
+        JPTInitializeNetwork(); JPTInstallManagementHook(); JPTInstallMetadataPrompt();
     }
 }
 #endif

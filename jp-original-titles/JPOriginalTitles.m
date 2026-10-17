@@ -1241,6 +1241,9 @@ NSData *JPTRewriteSearch(NSData *body, NSDictionary<NSString *, JPTTrackInfo *> 
     });
 }
 
+#include "JPTPreviousMetadata.m"
+#include "JPTCredits.m"
+
 #ifndef JPT_TEST
 
 #pragma mark - Logging
@@ -1765,6 +1768,7 @@ static BOOL JPTTemplate(NSURLRequest *auth, NSURLRequest **request, NSData **bod
 @property (nonatomic, strong) NSSet<NSString *> *traitTracks;
 @property (nonatomic, strong) NSSet<NSString *> *artistURIs;
 @property (nonatomic) BOOL search;
+@property (nonatomic) BOOL credits;
 @property (nonatomic) BOOL clientIsOriginalLanguage;
 @property (nonatomic, strong) NSData *body;
 @property (nonatomic, strong) NSMutableData *buffer;
@@ -1840,6 +1844,9 @@ static NSURLRequest *JPTPrepareRequest(NSURLSession *session, NSURLRequest *requ
                request.HTTPBodyStream != nil, encoding);
         return request;
     }
+    BOOL credits = JPTRequestHasCredits(body);
+    NSData *freshCredits = credits ? JPTCreditsFreshBody(body) : nil;
+    if (freshCredits) body = freshCredits;
     JPTSetTemplate(request, body);
     NSMutableSet<NSString *> *uris = [NSMutableSet set];
     NSMutableSet<NSString *> *traitTracks = [NSMutableSet set];
@@ -1849,8 +1856,9 @@ static NSURLRequest *JPTPrepareRequest(NSURLSession *session, NSURLRequest *requ
     BOOL knownArtists = JPTKnowsAnyArtist(artists);
     JPTLog(@"request %@%@ kinds %@, traits %lu, added %lu%@", delegateName, gzip ? @" gzip" : @"", JPTKindSummary(counts),
            (unsigned long)traitTracks.count, (unsigned long)uris.count, knownArtists ? @", known artists" : @"");
-    if (!traitTracks.count && !artists.count) return request;
+    if (!traitTracks.count && !artists.count && !credits) return request;
     JPTTaskState *state = [JPTTaskState new];
+    state.credits = credits;
     state.added = uris;
     state.traitTracks = traitTracks;
     state.artistURIs = artists;
@@ -1858,13 +1866,13 @@ static NSURLRequest *JPTPrepareRequest(NSURLSession *session, NSURLRequest *requ
     state.body = augmented ?: body;
     state.buffer = [NSMutableData data];
     *stateOut = state;
-    if (!augmented) return request;
+    if (!augmented && !freshCredits) return request;
     NSMutableURLRequest *copy = [request mutableCopy];
-    copy.HTTPBody = augmented;
+    copy.HTTPBody = augmented ?: body;
     // The augmented body is sent uncompressed
     if (gzip) [copy setValue:nil forHTTPHeaderField:@"Content-Encoding"];
     if ([copy valueForHTTPHeaderField:@"Content-Length"]) {
-        [copy setValue:[NSString stringWithFormat:@"%lu", (unsigned long)augmented.length] forHTTPHeaderField:@"Content-Length"];
+        [copy setValue:[NSString stringWithFormat:@"%lu", (unsigned long)copy.HTTPBody.length] forHTTPHeaderField:@"Content-Length"];
     }
     return copy;
 }
@@ -1909,7 +1917,8 @@ static void JPTFinishSearch(NSURLSession *session, NSURLRequest *searchRequest, 
         JPTLog(@"search %lu bytes, tracks %lu, changed %lu", (unsigned long)payload.length, (unsigned long)uris.count,
                (unsigned long)changes.count);
         for (NSString *change in changes) JPTLog(@"  %@", change);
-        // A nil rewrite retains the official search payload.
+        // Capture only the payload actually delivered to the client.
+        JPTCapturePreviousSearch(payload, patched ?: payload);
         deliver(patched ?: payload, nil);
     };
     NSURLRequest *template = nil;
@@ -2037,6 +2046,7 @@ static void JPTHookDelegate(NSString *name) {
         NSData *payload = state.buffer;
         NSInteger statusCode = [task.response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)task.response).statusCode : 0;
         void (^deliver)(NSData *, NSError *) = ^(NSData *data, NSError *lookupError) {
+            if (!lookupError && !error && statusCode == 200 && state.credits) data = JPTNativeCreditsResponse(data);
             if (!lookupError && data.length) origReceive(self, receiveSel, session, (NSURLSessionDataTask *)task, data);
             origComplete(self, completeSel, session, task, lookupError ?: error);
         };
@@ -2044,6 +2054,7 @@ static void JPTHookDelegate(NSString *name) {
             deliver(payload, nil);
             return;
         }
+        if (state.credits && !state.traitTracks.count && !state.artistURIs.count) { deliver(payload, nil); return; }
         if (state.search) {
             JPTFinishSearch(session, task.currentRequest ?: task.originalRequest, payload, deliver);
             return;
@@ -2077,7 +2088,8 @@ static void JPTHookDelegate(NSString *name) {
             if (!patched) JPTLog(@"WARNING metadata rewrite parse failure; URIs %@", state.traitTracks.allObjects);
             NSError *failure = !patched || (JPTStrictMode() && !JPTClientMetadataIsValid(payload))
                 ? JPTLookupFailureError(JPTLookupParseFailure, @"Metadata rewrite parse failure") : nil;
-            if (JPTBlockDelivery(failure, state.traitTracks)) deliver(nil, failure); else deliver(patched ?: payload, nil);
+            if (JPTBlockDelivery(failure, state.traitTracks)) deliver(nil, failure);
+            else { JPTCapturePreviousResponse(payload, patched ?: payload); deliver(patched ?: payload, nil); }
         };
         NSSet<NSString *> *missing = tracks ? JPTMissingOriginals(tracks, state.traitTracks, originals(), !clientOriginal) : nil;
         // Deliver later on the delegate queue once original-name metadata is fetched
