@@ -667,14 +667,14 @@ static JPTAlbumInfo *JPTPreferredAlbum(NSString *uri, NSDictionary<NSString *, J
         return (JPTAlbumInfo *)own;
     JPTTrackInfo *linked = all[own.canonicalURI];
     if (![own.canonicalURI isEqualToString:uri] && [linked isKindOfClass:[JPTAlbumInfo class]]
-        && !JPTHasCJK(own.name) && JPTHasCJK(linked.name)) return (JPTAlbumInfo *)linked;
+        && !JPTHasCJK(own.name)) return (JPTAlbumInfo *)linked;
     return (JPTAlbumInfo *)own;
 }
 
 static JPTTrackInfo *JPTAlbumOriginal(JPTTrackInfo *own, NSDictionary<NSString *, JPTTrackInfo *> *all) {
     if (JPTHasCJK(own.name) || !own.isrc.length || !own.duration || !own.number || !own.disc) return nil;
     JPTAlbumInfo *album = JPTPreferredAlbum(own.albumURI, all);
-    if (!album || !JPTHasCJK(album.name) || !album.trackURIs.count) return nil;
+    if (!album || !album.trackURIs.count) return nil;
     for (NSString *uri in album.trackURIs) if (!all[uri]) return nil;
     JPTTrackInfo *match = nil;
     for (NSString *uri in album.trackURIs) {
@@ -688,11 +688,16 @@ static JPTTrackInfo *JPTAlbumOriginal(JPTTrackInfo *own, NSDictionary<NSString *
         && match.number == own.number && match.disc == own.disc ? match : nil;
 }
 
-// A resolved non-CJK canonical still leaves the track to the indirect paths.
+static BOOL JPTDirectCompatible(JPTTrackInfo *own, JPTTrackInfo *target) {
+    return !(own.isrc.length && target.isrc.length && ![own.isrc isEqualToString:target.isrc]
+        && own.duration && target.duration && own.duration != target.duration);
+}
+
+// A non-CJK or contradictory canonical still leaves the track to the indirect paths.
 static BOOL JPTCanonicalUnresolved(NSString *uri, JPTTrackInfo *own, NSDictionary *all) {
     if (!own.canonicalURI.length || [own.canonicalURI isEqualToString:uri]) return YES;
     JPTTrackInfo *target = all[own.canonicalURI];
-    return target && !JPTHasCJK(target.name);
+    return target && (!JPTHasCJK(target.name) || !JPTDirectCompatible(own, target));
 }
 
 static JPTTrackInfo *JPTIndirectOriginal(NSString *uri, JPTTrackInfo *own, NSDictionary *all) {
@@ -736,7 +741,7 @@ static JPTTrackInfo *JPTSelectedOriginal(NSString *uri, JPTTrackInfo *info, NSDi
     if (!info || !info.name.length) return nil;
     NSString *canonical = JPTRomanizedCanonical(uri, info);
     JPTTrackInfo *original = canonical ? JPTMergeInfo(tracks[canonical], originals[canonical]) : nil;
-    if (original && JPTHasCJK(original.name)) return original;
+    if (original && JPTHasCJK(original.name) && JPTDirectCompatible(info, original)) return original;
     return JPTAlbumOriginal(info, originals) ?: JPTIndirectOriginal(uri, info, originals);
 }
 static JPTTrackInfo *JPTPreferredInfoWithArtists(NSString *uri, NSDictionary *tracks, NSDictionary *originals, NSDictionary *names) {
@@ -1575,14 +1580,14 @@ static void JPTFetchAssociatedAlbums(NSURLRequest *template, NSData *body, NSSet
             NSMutableSet *missing = [NSMutableSet set];
             for (NSString *uri in albums) {
                 JPTAlbumInfo *preferred = JPTPreferredAlbum(uri, snapshot);
-                if (!preferred || !JPTHasCJK(preferred.name)) continue;
+                if (!preferred) continue;
                 for (NSString *trackURI in preferred.trackURIs) if (!snapshot[trackURI]) [missing addObject:trackURI];
             }
             void (^complete)(NSError *) = ^(NSError *error) {
                 NSDictionary *ready = JPTOriginalSnapshot();
                 for (NSString *uri in albums) {
                     JPTAlbumInfo *preferred = JPTPreferredAlbum(uri, ready);
-                    if (!JPTHasCJK(preferred.name)) continue;
+                    if (!preferred) continue;
                     for (NSString *trackURI in preferred.trackURIs) {
                         if (!ready[trackURI]) JPTLog(@"incomplete original album %@ missing %@", uri, trackURI);
                     }
