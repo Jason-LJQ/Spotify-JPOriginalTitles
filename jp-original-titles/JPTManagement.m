@@ -13,7 +13,7 @@ static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
 static NSString *const kJPTResetRequestKey = @"JPOriginalTitlesResetRequest";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
 static NSString *const kJPTMetadataPromptKey = @"JPOriginalTitlesMetadataPromptOffered";
-static NSString *const kJPTBuild = @"v7.0.4";
+static NSString *const kJPTBuild = @"v7.0.3";
 static NSString *const kJPTBuildID = @"20261024-recording-album-match";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
