@@ -4,11 +4,11 @@ An iOS plugin that restores original track, album and artist names in Spotify 9.
 
 This repository contains prebuilt dylibs and installation instructions.
 
-| Version | Download | Features |
-| --- | --- | --- |
-| v7 — v7.0.3, current release | [JPOriginalTitles.dylib](https://github.com/Jason-LJQ/Spotify-JPOriginalTitles/releases/download/v7.0.3/JPOriginalTitles.dylib) | Original names, original metadata in Credits, SQLite storage and optional metadata refresh on upgrade |
-| v6 — v6.3.3 | [JPOriginalTitles.dylib](jp-original-titles/dist/v6.3.3/JPOriginalTitles.dylib) | Original names, artist links, search, associated-album matching and maintenance controls |
-| v5 | [JPOriginalTitles.dylib](jp-original-titles/dist/JPOriginalTitles.dylib) | Original names in playlists, album pages, the player bar and queue |
+| Version               | Download | Features |
+|-----------------------| --- | --- |
+| v7.x, current release | [JPOriginalTitles.dylib](https://github.com/Jason-LJQ/Spotify-JPOriginalTitles/releases/download/v7.0.3/JPOriginalTitles.dylib) | Original names, original metadata in Credits, SQLite storage and optional metadata refresh on upgrade |
+| v6.3.3                | JPOriginalTitles.dylib] | Original names, artist links, search, associated-album matching and maintenance controls |
+| v5                    | JPOriginalTitles.dylib | Original names in playlists, album pages, the player bar and queue |
 
 ## Screenshots
 
@@ -38,7 +38,7 @@ Completed lookups without an unambiguous original name keep the available client
 
 Requires Spotify iOS 9.1.88 with a plugin loader that loads `Frameworks/*.dylib`.
 
-1. Download the current v7.0.3 dylib above.
+1. Download the latest release.
 2. Put `JPOriginalTitles.dylib` into `Payload/Spotify.app/Frameworks/` with mode 755, then repackage and install. Keep only one version of the plugin.
 3. Open **Settings and privacy → Original Titles**, directly below **Eevee Settings**.
 

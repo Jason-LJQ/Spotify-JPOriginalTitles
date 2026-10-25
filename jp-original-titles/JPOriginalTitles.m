@@ -463,7 +463,7 @@ NSData *JPTTrackRequest(NSData *templateBody, NSSet<NSString *> *uris) {
 static void JPTIndexOriginals(NSDictionary<NSString *, JPTTrackInfo *> *tracks);
 
 // Collects successful TRACK_V4 payloads keyed by entity URI
-NSDictionary<NSString *, JPTTrackInfo *> *JPTCollectTracks(NSData *body) {
+static NSDictionary<NSString *, JPTTrackInfo *> *JPTCollectTracksMode(NSData *body, BOOL index) {
     NSMutableDictionary<NSString *, JPTTrackInfo *> *tracks = [NSMutableDictionary dictionary];
     JPTReader r = JPTReaderMake(body.bytes, body.length);
     JPTField f;
@@ -483,12 +483,15 @@ NSDictionary<NSString *, JPTTrackInfo *> *JPTCollectTracks(NSData *body) {
             if (info) tracks[uri] = info;
         }
     }
-    if (ok) JPTIndexOriginals(tracks);
+    if (ok && index) JPTIndexOriginals(tracks);
     return ok ? tracks : nil;
 }
 
-static NSDictionary<NSString *, JPTTrackInfo *> *JPTCollectMetadata(NSData *body) {
-    NSMutableDictionary *all = [JPTCollectTracks(body) mutableCopy];
+NSDictionary<NSString *, JPTTrackInfo *> *JPTCollectTracks(NSData *body) {
+    return JPTCollectTracksMode(body, YES);
+}
+static NSDictionary<NSString *, JPTTrackInfo *> *JPTCollectMetadataMode(NSData *body, BOOL index) {
+    NSMutableDictionary *all = [JPTCollectTracksMode(body, index) mutableCopy];
     if (!all) return nil;
     JPTReader r = JPTReaderMake(body.bytes, body.length); JPTField f; BOOL ok;
     while (JPTNext(&r, &f, &ok)) {
@@ -504,6 +507,10 @@ static NSDictionary<NSString *, JPTTrackInfo *> *JPTCollectMetadata(NSData *body
         if (!aok) return nil;
     }
     return ok ? all : nil;
+}
+
+static NSDictionary<NSString *, JPTTrackInfo *> *JPTCollectMetadata(NSData *body) {
+    return JPTCollectMetadataMode(body, YES);
 }
 
 // Kana, CJK ideographs and Hangul; romanized releases contain none of these
@@ -688,17 +695,18 @@ static JPTTrackInfo *JPTAlbumOriginal(JPTTrackInfo *own, NSDictionary<NSString *
         && match.number == own.number && match.disc == own.disc ? match : nil;
 }
 
+// A resolved non-CJK canonical still leaves the track to the indirect paths.
 static BOOL JPTDirectCompatible(JPTTrackInfo *own, JPTTrackInfo *target) {
     return !(own.isrc.length && target.isrc.length && ![own.isrc isEqualToString:target.isrc]
         && own.duration && target.duration && own.duration != target.duration);
 }
 
-// A non-CJK or contradictory canonical still leaves the track to the indirect paths.
 static BOOL JPTCanonicalUnresolved(NSString *uri, JPTTrackInfo *own, NSDictionary *all) {
     if (!own.canonicalURI.length || [own.canonicalURI isEqualToString:uri]) return YES;
     JPTTrackInfo *target = all[own.canonicalURI];
     return target && (!JPTHasCJK(target.name) || !JPTDirectCompatible(own, target));
 }
+
 
 static JPTTrackInfo *JPTIndirectOriginal(NSString *uri, JPTTrackInfo *own, NSDictionary *all) {
     if (JPTHasCJK(own.name) || !own.isrc.length || !own.duration || !own.number || !own.disc
@@ -926,6 +934,13 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
     NSDictionary *clientMetadata = JPTCollectMetadata(body);
     if (!clientMetadata) return nil;
     [metadata addEntriesFromDictionary:clientMetadata];
+    for (NSString *uri in clientMetadata) if ([clientMetadata[uri] isKindOfClass:JPTAlbumInfo.class]) {
+        JPTAlbumInfo *client = clientMetadata[uri]; JPTTrackInfo *cached = originals[uri];
+        JPTAlbumInfo *album = [JPTAlbumInfo new];
+        album.name = JPTPick(client.name, cached.name);
+        album.originalTitle = JPTPick(client.originalTitle, cached.originalTitle);
+        album.canonicalURI = client.canonicalURI; album.trackURIs = client.trackURIs; metadata[uri] = album;
+    }
 
     NSMutableData *out = [NSMutableData dataWithCapacity:body.length];
     JPTReader r = JPTReaderMake(body.bytes, body.length);
@@ -1275,6 +1290,31 @@ static NSDictionary<NSString *, JPTTrackInfo *> *JPTOriginalSnapshot(void) {
         return [gOriginalCache copy];
     }
 }
+static void JPTCacheOriginals(NSDictionary *values) {
+    NSMutableDictionary *merged = [NSMutableDictionary dictionary];
+    @synchronized (gOriginalCache) {
+        for (NSString *uri in values) {
+            JPTTrackInfo *incoming = values[uri], *previous = gOriginalCache[uri];
+            if ([incoming isKindOfClass:JPTAlbumInfo.class]) {
+                JPTAlbumInfo *album = [JPTAlbumInfo new];
+                album.name = JPTHasCJK(previous.name) ? previous.name : incoming.name;
+                album.originalTitle = JPTHasCJK(previous.originalTitle) ? previous.originalTitle : incoming.originalTitle;
+                album.canonicalURI = incoming.canonicalURI;
+                album.trackURIs = [(JPTAlbumInfo *)incoming trackURIs]; merged[uri] = album;
+            } else {
+                JPTTrackInfo *info = JPTMergeInfo(incoming, previous);
+                info.name = JPTHasCJK(previous.name) ? previous.name : info.name;
+                info.originalTitle = JPTHasCJK(previous.originalTitle) ? previous.originalTitle : info.originalTitle;
+                info.versionTitle = JPTHasCJK(previous.versionTitle) ? previous.versionTitle : info.versionTitle;
+                info.albumName = JPTHasCJK(previous.albumName) ? previous.albumName : info.albumName;
+                merged[uri] = info;
+            }
+        }
+        [gOriginalCache addEntriesFromDictionary:merged];
+    }
+    JPTIndexOriginals(merged);
+}
+
 
 static BOOL JPTStrictMode(void);
 
@@ -1291,6 +1331,9 @@ static NSError *JPTLookupFailureError(JPTLookupFailure type, NSString *message) 
 @interface JPTResolution : NSObject
 @property (nonatomic, strong) NSError *failure;
 @property (nonatomic) BOOL stopped;
+@property (nonatomic) BOOL anonymous;
+@property (nonatomic, strong) dispatch_group_t anonymousQueries;
+@property (nonatomic, strong) NSMutableDictionary *anonymousResults;
 @end
 @implementation JPTResolution
 @end
@@ -1298,7 +1341,9 @@ static char kJPTResolutionKey;
 static JPTResolution *JPTResolutionFor(NSURLRequest *request) { return objc_getAssociatedObject(request, &kJPTResolutionKey); }
 static NSURLRequest *JPTBeginResolution(NSURLRequest *request) {
     NSURLRequest *copy = [request mutableCopy];
-    objc_setAssociatedObject(copy, &kJPTResolutionKey, [JPTResolution new], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    JPTResolution *state = [JPTResolution new];
+    state.anonymousQueries = dispatch_group_create(); state.anonymousResults = [NSMutableDictionary dictionary];
+    objc_setAssociatedObject(copy, &kJPTResolutionKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return copy;
 }
 static NSError *JPTStopped(NSURLRequest *request) {
@@ -1324,13 +1369,16 @@ static BOOL JPTBlockDelivery(NSError *error, NSSet *uris) {
     return strict;
 }
 
-// Check response cancellation again when queued work reaches the global request limit.
-static void JPTLookupRequest(NSURLRequest *request, NSURLRequest *owner, void (^done)(NSData *, NSURLResponse *, NSError *)) {
-    static NSOperationQueue *queue;
-    static NSURLSession *session;
+
+
+// Check cancellation when work reaches its account or anonymous request limit.
+static void JPTLookupRequestMode(NSURLRequest *request, NSURLRequest *owner, BOOL anonymous, void (^done)(NSData *, NSURLResponse *, NSError *)) {
+    static NSOperationQueue *queue, *anonymousQueue;
+    static NSURLSession *session, *anonymousSession;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         queue = [NSOperationQueue new]; queue.maxConcurrentOperationCount = 3;
+        anonymousQueue = [NSOperationQueue new]; anonymousQueue.maxConcurrentOperationCount = 3;
         NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
 #ifdef JPT_LOOKUP_TEST_PROTOCOL
         config.protocolClasses = @[NSClassFromString(@"JPTTestTransportProtocol")];
@@ -1342,16 +1390,25 @@ static void JPTLookupRequest(NSURLRequest *request, NSURLRequest *owner, void (^
         config.timeoutIntervalForRequest = 8; config.timeoutIntervalForResource = 20;
 #endif
         session = [NSURLSession sessionWithConfiguration:config];
+        NSURLSessionConfiguration *isolated = [config copy];
+        isolated.HTTPCookieStorage = nil; isolated.URLCredentialStorage = nil;
+        isolated.URLCache = nil; isolated.HTTPShouldSetCookies = NO;
+        anonymousSession = [NSURLSession sessionWithConfiguration:isolated];
     });
-    [queue addOperationWithBlock:^{
+    [(anonymous ? anonymousQueue : queue) addOperationWithBlock:^{
         NSError *stopped = JPTStopped(owner);
         if (stopped) { done(nil, nil, stopped); return; }
         dispatch_semaphore_t finished = dispatch_semaphore_create(0);
-        [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        void (^completion)(NSData *, NSURLResponse *, NSError *)=^(NSData *data, NSURLResponse *response, NSError *error) {
             done(data, response, error); dispatch_semaphore_signal(finished);
-        }] resume];
+        };
+        [[(anonymous ? anonymousSession : session) dataTaskWithRequest:request completionHandler:completion] resume];
         dispatch_semaphore_wait(finished, DISPATCH_TIME_FOREVER);
     }];
+}
+
+static void JPTLookupRequest(NSURLRequest *request, NSURLRequest *owner, void (^done)(NSData *, NSURLResponse *, NSError *)) {
+    JPTLookupRequestMode(request, owner, JPTResolutionFor(owner).anonymous, done);
 }
 
 // Completed absences are distinct from failed or missing entries.
@@ -1396,6 +1453,8 @@ static NSError *JPTValidateLookup(NSData *body, NSSet *uris, NSMutableDictionary
     return JPTInspectLookup(body, uris, values, artist, [NSMutableSet set], &whole, &terminal);
 }
 
+static void JPTStartAnonymousQuery(NSURLRequest *, NSData *, NSSet *, NSString *, BOOL);
+
 // One wire attempt. Entry retries and split retries use this same transport and validator.
 static void JPTQueryAttempt(NSURLRequest *template, NSData *body, NSSet *batch, NSString *language, BOOL artist,
                             void (^done)(NSDictionary *, NSSet *, NSError *, BOOL, BOOL)) {
@@ -1420,13 +1479,14 @@ static void JPTQueryAttempt(NSURLRequest *template, NSData *body, NSSet *batch, 
             [NSString stringWithFormat:@"HTTP %ld %@", (long)code, error.localizedDescription ?: @""]);
         else {
             // Collectors can reject a malformed entry; inspection still retains other valid entities.
-            NSDictionary *collected = artist ? (NSDictionary *)JPTCollectArtistNames(data) : (NSDictionary *)JPTCollectMetadata(data);
+            NSDictionary *collected = artist ? (NSDictionary *)JPTCollectArtistNames(data)
+                : JPTCollectMetadataMode(data, !JPTResolutionFor(template).anonymous);
             if (collected) [values addEntriesFromDictionary:collected];
             failure = JPTInspectLookup(data, batch, values, artist, retry, &whole, &terminal);
         }
         if (whole) [retry unionSet:batch];
         if (terminal) { JPTLog(@"lookup no retry: %@ HTTP %ld; URIs %@", JPTFailureName(failure), (long)code, batch.allObjects); JPTRecordFailure(template, failure, YES); }
-        if (!artist && values.count) { @synchronized (gOriginalCache) { [gOriginalCache addEntriesFromDictionary:values]; } }
+        if (!artist && values.count && !JPTResolutionFor(template).anonymous) JPTCacheOriginals(values);
         JPTLog(@"lookup %@: %lu requested, %lu returned, status %ld, complete %d", language, (unsigned long)batch.count,
                (unsigned long)values.count, (long)code, failure == nil);
         done(values, retry, failure, whole, terminal);
@@ -1492,6 +1552,9 @@ static void JPTResolveAttempt(NSURLRequest *template, NSData *body, NSSet *batch
 static void JPTFetchQueryBatch(NSURLRequest *template, NSData *body, NSSet *batch, NSString *language, BOOL artist,
                                void (^done)(NSDictionary *, NSError *)) {
     if (!JPTResolutionFor(template)) template = JPTBeginResolution(template);
+#ifndef JPT_TEST_PRIMARY_ONLY
+    if (!JPTResolutionFor(template).anonymous) JPTStartAnonymousQuery(template, body, batch, language, artist);
+#endif
     JPTResolveAttempt(template, body, batch, language, artist, ^(NSDictionary *values, NSError *error, BOOL whole) {
         void (^complete)(NSDictionary *, NSError *) = ^(NSDictionary *got, NSError *failure) {
             NSMutableDictionary *merged = [values mutableCopy]; [merged addEntriesFromDictionary:got];
@@ -1625,15 +1688,83 @@ static NSSet<NSString *> *JPTSiblingSourceAlbums(NSDictionary *snapshot, NSSet<N
     return eligible;
 }
 
+#pragma mark - Paired anonymous credentials
+
+static NSMutableURLRequest *JPTAnonymousRequest(NSURL *url, NSString *token, NSData *body) {
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPShouldHandleCookies = NO;
+    request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    if (body) {
+        request.HTTPMethod = @"POST"; request.HTTPBody = body;
+        [request setValue:@"application/x-protobuf" forHTTPHeaderField:@"Content-Type"];
+        [request setValue:@"application/x-protobuf" forHTTPHeaderField:@"Accept"];
+        [request setValue:@"zh-Hans" forHTTPHeaderField:@"Accept-Language"];
+    }
+    if (token.length) [request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    return request;
+}
+static NSDictionary *JPTAnonymousSession(NSData *html, NSDate *now) {
+    NSString *text = [[NSString alloc] initWithData:html encoding:NSUTF8StringEncoding];
+    NSRegularExpression *pattern = [NSRegularExpression regularExpressionWithPattern:@"<script[^>]*id=[\"']__NEXT_DATA__[\"'][^>]*>([\\s\\S]*?)</script>" options:0 error:nil];
+    NSTextCheckingResult *hit = text ? [pattern firstMatchInString:text options:0 range:NSMakeRange(0, text.length)] : nil;
+    if (!hit) return nil;
+    NSData *json = [[text substringWithRange:[hit rangeAtIndex:1]] dataUsingEncoding:NSUTF8StringEncoding];
+    id root = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
+    if (![root isKindOfClass:NSDictionary.class]) return nil;
+    id props = root[@"props"], page = [props isKindOfClass:NSDictionary.class] ? props[@"pageProps"] : nil;
+    id state = [page isKindOfClass:NSDictionary.class] ? page[@"state"] : nil;
+    id settings = [state isKindOfClass:NSDictionary.class] ? state[@"settings"] : nil;
+    id session = [settings isKindOfClass:NSDictionary.class] ? settings[@"session"] : nil;
+    if (![session isKindOfClass:NSDictionary.class] || ![session[@"isAnonymous"] isKindOfClass:NSNumber.class]
+        || ![session[@"isAnonymous"] boolValue] || ![session[@"accessToken"] isKindOfClass:NSString.class]
+        || ![session[@"accessTokenExpirationTimestampMs"] isKindOfClass:NSNumber.class]) return nil;
+    NSString *token = session[@"accessToken"];
+    NSTimeInterval expiry = [session[@"accessTokenExpirationTimestampMs"] doubleValue] / 1000;
+    if (!token.length || expiry <= now.timeIntervalSince1970) return nil;
+    return @{@"token":token, @"expiry":@(expiry)};
+}
+static NSString *gJPTAnonymousToken;
+static NSTimeInterval gJPTAnonymousExpiry;
+static NSMutableArray *gJPTAnonymousWaiters;
+static void JPTGetAnonymousToken(NSURLRequest *owner, NSString *uri, void (^done)(NSString *)) {
+    @synchronized (JPTResolution.class) {
+        NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+        if (gJPTAnonymousToken.length && now < gJPTAnonymousExpiry) { done(gJPTAnonymousToken); return; }
+        if (gJPTAnonymousWaiters) { [gJPTAnonymousWaiters addObject:[done copy]]; return; }
+        gJPTAnonymousWaiters = [NSMutableArray arrayWithObject:[done copy]];
+    }
+    NSArray *parts = [uri componentsSeparatedByString:@":"];
+    NSURL *url = parts.count == 3 && [parts[2] length] == 22
+        ? [NSURL URLWithString:[NSString stringWithFormat:@"https://open.spotify.com/embed/%@/%@", parts[1], parts[2]]] : nil;
+    void (^complete)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSDictionary *session = !error && [(NSHTTPURLResponse *)response statusCode] == 200 ? JPTAnonymousSession(data, NSDate.date) : nil;
+        NSArray *waiters;
+        @synchronized (JPTResolution.class) {
+            gJPTAnonymousToken = session[@"token"]; gJPTAnonymousExpiry = [session[@"expiry"] doubleValue];
+            waiters = [gJPTAnonymousWaiters copy]; gJPTAnonymousWaiters = nil;
+        }
+        JPTLog(@"anonymous bootstrap HTTP %ld accepted %d", (long)[(NSHTTPURLResponse *)response statusCode], session != nil);
+        for (void (^callback)(NSString *) in waiters) callback(session[@"token"]);
+    };
+    if (!url) { complete(nil, nil, nil); return; }
+    NSMutableURLRequest *request=JPTAnonymousRequest(url,nil,nil);
+    request.timeoutInterval = owner.timeoutInterval;
+    JPTLookupRequestMode(request, owner, YES, complete);
+}
+
+#include "JPTAnonymousNames.m"
+
 // Discover only one sibling-canonical hop; no title search or recursive album walk.
 static void JPTFetchAlbumOriginals(NSURLRequest *template, NSData *body, NSSet<NSString *> *uris, void (^done)(NSError *)) {
     if (!JPTResolutionFor(template)) template = JPTBeginResolution(template);
     NSError *stopped = JPTStopped(template); if (stopped) { done(stopped); return; }
     JPTFetchAssociatedAlbums(template, body, uris, ^(NSError *associationError) {
+        if (JPTStopped(template)) { done(associationError ?: JPTStopped(template)); return; }
+        NSSet *pending = uris;
         NSDictionary *initial = JPTOriginalSnapshot();
-        NSSet *sourceAlbums = JPTSiblingSourceAlbums(initial, uris);
+        NSSet *sourceAlbums = JPTSiblingSourceAlbums(initial, pending);
         NSMutableSet *needed = [NSMutableSet set];
-        for (NSString *uri in uris) {
+        for (NSString *uri in pending) {
             JPTTrackInfo *own = initial[uri]; JPTAlbumInfo *album = initial[own.albumURI];
             if (!own || JPTHasCJK(own.name) || !own.isrc.length || JPTAlbumOriginal(own, initial)
                 || !JPTCanonicalUnresolved(uri, own, initial)) continue;
@@ -1654,7 +1785,7 @@ static void JPTFetchAlbumOriginals(NSURLRequest *template, NSData *body, NSSet<N
             fetchMissing(links, ^(NSError *linkError) {
                 NSDictionary *linked = JPTOriginalSnapshot(); NSMutableSet *albums = [NSMutableSet set];
                 for (NSString *uri in links) if ([linked[uri] albumURI]) [albums addObject:[linked[uri] albumURI]];
-                for (NSString *uri in uris) for (NSString *candidate in JPTReverseCandidates(uri))
+                for (NSString *uri in pending) for (NSString *candidate in JPTReverseCandidates(uri))
                     if ([linked[candidate] albumURI]) [albums addObject:[linked[candidate] albumURI]];
                 fetchMissing(albums, ^(NSError *albumError) {
                     NSDictionary *snapshot = JPTOriginalSnapshot(); NSMutableSet *tracks = [NSMutableSet set];
@@ -1925,8 +2056,11 @@ static void JPTFinishSearch(NSURLSession *session, NSURLRequest *searchRequest, 
         else complete();
     };
     void (^resolveArtists)(NSError *) = ^(NSError *error) {
-        JPTFetchArtistOriginals(template, templateBody,
-        JPTResolutionArtists(JPTOriginalSnapshot(), uris), onQueue); };
+        NSSet *artists = JPTResolutionArtists(JPTOriginalSnapshot(), uris);
+        JPTFetchArtistOriginals(template, templateBody, artists, ^(NSError *artistError) {
+            NSMutableSet *targets = [uris mutableCopy]; [targets unionSet:artists];
+            JPTFinishAnonymousQueries(template, targets, ^{ onQueue(artistError); });
+        }); };
     void (^resolveAlbums)(NSError *) = ^(NSError *error) {
         JPTFetchAlbumOriginals(template, templateBody, uris, resolveArtists); };
     void (^canonicals)(NSError *) = ^(NSError *error) {
@@ -2055,12 +2189,10 @@ static void JPTHookDelegate(NSString *name) {
         NSURLRequest *template = JPTBeginResolution(task.currentRequest ?: task.originalRequest);
         BOOL clientOriginal = state.clientIsOriginalLanguage;
         if (clientOriginal && tracks.count) {
-            @synchronized (gOriginalCache) { [gOriginalCache addEntriesFromDictionary:tracks]; }
+            JPTCacheOriginals(tracks);
         }
         NSDictionary<NSString *, JPTTrackInfo *> *(^originals)(void) = ^NSDictionary<NSString *, JPTTrackInfo *> *{
-            NSMutableDictionary<NSString *, JPTTrackInfo *> *all = [JPTOriginalSnapshot() mutableCopy];
-            if (clientOriginal && tracks) [all addEntriesFromDictionary:tracks];
-            return all;
+            return JPTOriginalSnapshot();
         };
         void (^finish)(void) = ^{
             NSMutableArray<NSString *> *changes = [NSMutableArray array];
@@ -2090,7 +2222,10 @@ static void JPTHookDelegate(NSString *name) {
         void (^resolveArtists)(NSError *) = ^(NSError *error) {
             NSMutableSet *artists = [state.artistURIs mutableCopy] ?: [NSMutableSet set];
             [artists unionSet:JPTResolutionArtists(originals(), state.traitTracks)];
-            JPTFetchArtistOriginals(template, state.body, artists, onQueue);
+            JPTFetchArtistOriginals(template, state.body, artists, ^(NSError *artistError) {
+                NSMutableSet *targets = [state.traitTracks mutableCopy]; [targets unionSet:artists];
+                JPTFinishAnonymousQueries(template, targets, ^{ onQueue(artistError); });
+            });
         };
         void (^resolveAlbums)(NSError *) = ^(NSError *error) {
             JPTFetchAlbumOriginals(template, state.body, state.traitTracks, resolveArtists); };
