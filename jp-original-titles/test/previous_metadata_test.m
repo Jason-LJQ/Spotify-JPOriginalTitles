@@ -199,6 +199,26 @@ int main(void) {
         gJPTPreviousMetadataRecords = nil;
         Check(JPTPreviousFields(@"spotify:track:concurrent31").count == 1 && gJPTPreviousMetadataRecords.count == 32, @"parallel capture persistence reload");
         Reset();
+        // Combined delivery titles use the stored raw old title and never feed back into stored pairs.
+        Reset();
+        NSString *bar = @"\uFF5C";
+        NSData *raw = Join(Response(uri, Value(@"Roman", @"Album", @[@"Artist"], NO), 10), Response(uri, Value(@"Roman", @"Album", @[@"Artist"], YES), 178));
+        NSData *patched = Join(Response(uri, Value(@"原曲", @"Album", @[@"Artist"], NO), 10), Response(uri, Value(@"原曲", @"Album", @[@"Artist"], YES), 178));
+        Check(JPTCapturePreviousResponse(raw, patched), @"combined capture commits");
+        NSData *shown = JPTPresentResponseTitles(patched);
+        NSDictionary *carriers = JPTPreviousResponseCarriers(shown);
+        NSString *combined = [NSString stringWithFormat:@"原曲%@Roman", bar];
+        Check([carriers[@"10|spotify:track:one"][0][@"title"] isEqual:combined] && [carriers[@"178|spotify:track:one"][0][@"title"] isEqual:combined], @"TRACK_V4 and IdentityTrait use fullwidth bar without spaces");
+        Check([carriers[@"178|spotify:track:one"][0][@"album"] isEqual:@"Album"] && [carriers[@"10|spotify:track:one"][0][@"artists"] isEqual:@"Artist"], @"album and artists unchanged");
+        Check([JPTPreviousFields(uri)[@"title"] isEqual:@"Roman"] && [gJPTPreviousMetadataRecords[uri][@"fields"][@"title"][@"new"] isEqual:@"原曲"], @"stored pair keeps raw names");
+        Check(!JPTPresentResponseTitles(raw), @"unrewritten server title gains no suffix");
+        Check(!JPTPresentResponseTitles(shown), @"combined delivery is not combined twice");
+        Check(!JPTPresentResponseTitles(Response(two, Value(@"原曲", nil, nil, NO), 10)), @"other URI with same title gains no suffix");
+        NSData *searchShown = JPTPresentSearchTitles(Search(uri, @"原曲", @"Album", @[@"Artist"]));
+        NSDictionary *searchCarriers = JPTPreviousSearchCarriers(searchShown);
+        Check([searchCarriers[@"search|spotify:track:one"][0][@"title"] isEqual:combined] && [searchCarriers[@"search|spotify:track:one"][0][@"album"] isEqual:@"Album"], @"search track title combined only");
+        Check(!JPTPresentSearchTitles(Search(uri, @"Roman", nil, nil)), @"search raw title unchanged");
+        Check(!JPTPresentResponseTitles([@"bad" dataUsingEncoding:NSUTF8StringEncoding]), @"unparsable body is left to the caller");
         printf("PASS %lu checks\n", (unsigned long)checks);
     }
     return 0;

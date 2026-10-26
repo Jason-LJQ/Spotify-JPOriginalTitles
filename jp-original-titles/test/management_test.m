@@ -39,6 +39,11 @@ int main(void) { @autoreleasepool {
     JPTSetStrictMode(defaults, YES); Check(JPTStrictMode(), @"strict updates immediately");
     atomic_store(&gJPTStrict, false); JPTLoadStrictMode(defaults); Check(JPTStrictMode(), @"strict persists");
     JPTSetStrictMode(defaults, NO); Check(!JPTStrictMode(), @"strict turns off");
+    JPTLoadCombineTitles(defaults); Check(JPTCombineTitles(), @"combined titles default on");
+    JPTSetCombineTitles(defaults, NO); Check(!JPTCombineTitles(), @"combined titles turn off immediately");
+    atomic_store(&gJPTCombineTitles, true); JPTLoadCombineTitles(defaults); Check(!JPTCombineTitles(), @"combined titles opt-out persists");
+    Check(![defaults objectForKey:kJPTResetRequestKey], @"title setting alone saves no reset request");
+    JPTSetCombineTitles(defaults, YES); Check(JPTCombineTitles(), @"combined titles turn on");
     Check(JPTMetadataPromptRequired(defaults), @"fresh version offers reset");
     [defaults setBool:YES forKey:kJPTMetadataPromptKey]; Check(JPTMetadataPromptRequired(defaults), @"legacy boolean does not suppress new version prompt");
     [defaults setObject:@"v7" forKey:kJPTMetadataPromptKey]; Check(JPTMetadataPromptRequired(defaults), @"older plugin version prompts again");

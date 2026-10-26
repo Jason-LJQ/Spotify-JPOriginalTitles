@@ -13,8 +13,8 @@ static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
 static NSString *const kJPTResetRequestKey = @"JPOriginalTitlesResetRequest";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
 static NSString *const kJPTMetadataPromptKey = @"JPOriginalTitlesMetadataPromptOffered";
-static NSString *const kJPTBuild = @"v7.1-prerelease";
-static NSString *const kJPTBuildID = @"20261025-v71-prerelease";
+static NSString *const kJPTBuild = @"v7.1";
+static NSString *const kJPTBuildID = @"20261025-v71";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
 static atomic_bool gJPTStrict;
@@ -25,6 +25,16 @@ static void JPTSetStrictMode(NSUserDefaults *defaults, BOOL enabled) {
     [defaults setBool:enabled forKey:kJPTStrictKey]; [defaults synchronize]; atomic_store(&gJPTStrict, enabled);
 }
 static NSString *JPTStrictSummary(void) { return [NSString stringWithFormat:@"Strict mode: %@", JPTStrictMode() ? @"on" : @"off"]; }
+static atomic_bool gJPTCombineTitles;
+static NSString *const kJPTCombineTitlesKey = @"JPOriginalTitlesCombineTitles";
+static BOOL JPTCombineTitles(void) { return atomic_load(&gJPTCombineTitles); }
+// Combined titles default on, matching the desktop extension.
+static void JPTLoadCombineTitles(NSUserDefaults *defaults) {
+    atomic_store(&gJPTCombineTitles, [defaults objectForKey:kJPTCombineTitlesKey] ? [defaults boolForKey:kJPTCombineTitlesKey] : YES);
+}
+static void JPTSetCombineTitles(NSUserDefaults *defaults, BOOL enabled) {
+    [defaults setBool:enabled forKey:kJPTCombineTitlesKey]; [defaults synchronize]; atomic_store(&gJPTCombineTitles, enabled);
+}
 static BOOL gJPTManagementHookInstalled;
 
 static dispatch_queue_t JPTLogQueue(void) {
@@ -150,6 +160,7 @@ static NSString *JPTDiagnosticSummary(void) {
         [lines addObject:[NSString stringWithFormat:@"Delegate %@: %@", name, found ? @"hooked" : @"unavailable"]];
     }
     [lines addObject:JPTStrictSummary()];
+    [lines addObject:[NSString stringWithFormat:@"Combined titles: %@", JPTCombineTitles() ? @"on" : @"off"]];
     [lines addObject:[NSString stringWithFormat:@"Logging: %@", atomic_load(&gJPTLogging) ? @"on" : @"off"]];
     [lines addObject:JPTStorageSummary()];
     [lines addObject:[@"Plugin database: " stringByAppendingString:JPTStoragePath()]];
@@ -394,9 +405,9 @@ static void JPTInstallMetadataPrompt(void) {
     self.navigationItem.rightBarButtonItem.enabled = self.resetPlugin || self.resetMetadata || self.resetPlayback;
     [self.tableView reloadData];
 }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return section == 0 ? 4 : section == 1 ? 4 : 3; }
-- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section { return @[@"Status", @"Diagnostics", @"Reset Options"][section]; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 4; }
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return section == 0 ? 4 : section == 1 ? 4 : section == 2 ? 3 : 1; }
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section { return @[@"Status", @"Diagnostics", @"Reset Options", @"Title Display"][section]; }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 1) return @"Logging is off by default. Logs may include track names and URIs. No authentication tokens or full responses are recorded. Two log files are retained, up to 1 MB each.";
     if (section == 2) return @"Select independent reset options, then tap Apply. Apply saves the request and closes the app immediately. Reopen Spotify to complete the reset. Metadata reset requires online resync and may discard unsynced offline changes. Playback resume reset deletes the saved queue and position without a backup. Select both metadata and playback resume resets to fix stale restored titles. Login, settings and audio files are kept.";
@@ -434,6 +445,12 @@ static void JPTInstallMetadataPrompt(void) {
             UISwitch *toggle = [UISwitch new]; toggle.on = JPTStrictMode(); toggle.accessibilityIdentifier = @"jpt.strict";
             [toggle addTarget:self action:@selector(strictChanged:) forControlEvents:UIControlEventValueChanged]; cell.accessoryView = toggle;
         } else cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    } else if (index.section == 3) {
+        cell.textLabel.text = @"Show Original and Previous Song Titles";
+        cell.detailTextLabel.text = @"Show changed songs as Original title\uFF5CPrevious title. Turn off to show only the original title.";
+        cell.accessibilityIdentifier = @"jpt.combineTitles";
+        UISwitch *toggle = [UISwitch new]; toggle.on = JPTCombineTitles(); toggle.accessibilityIdentifier = @"jpt.combineTitles";
+        [toggle addTarget:self action:@selector(combineTitlesChanged:) forControlEvents:UIControlEventValueChanged]; cell.accessoryView = toggle;
     } else {
         cell.textLabel.text = @[@"Reset Plugin Cache", @"Reset Spotify Metadata and Library Index", @"Reset Playback Resume State"][index.row];
         if (index.row == 0) {
@@ -460,6 +477,12 @@ static void JPTInstallMetadataPrompt(void) {
     if (toggle.on) JPTLog(@"diagnostics enabled\n%@", JPTDiagnosticSummary());
 }
 - (void)strictChanged:(UISwitch *)toggle { JPTSetStrictMode([NSUserDefaults standardUserDefaults], toggle.on); }
+- (void)combineTitlesChanged:(UISwitch *)toggle {
+    JPTSetCombineTitles([NSUserDefaults standardUserDefaults], toggle.on);
+    // Cached titles keep the previous display; preselect the metadata reset but leave Apply to the user.
+    self.resetMetadata = YES; [self refresh];
+    [self message:@"Title Display Changed" body:@"New titles use this setting now. Titles cached by Spotify keep the previous display until its metadata is reset. Reset Spotify Metadata is selected: tap Apply to reset, or deselect it to keep the cache."];
+}
 - (void)apply {
     if (!self.resetPlugin && !self.resetMetadata && !self.resetPlayback) return;
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
@@ -622,6 +645,7 @@ __attribute__((constructor)) static void JPTInit(void) {
     @autoreleasepool {
         atomic_store(&gJPTLogging, [[NSUserDefaults standardUserDefaults] boolForKey:kJPTLoggingKey]);
         JPTLoadStrictMode([NSUserDefaults standardUserDefaults]);
+        JPTLoadCombineTitles([NSUserDefaults standardUserDefaults]);
         JPTProcessReset(JPTUsersPath(), [NSUserDefaults standardUserDefaults]);
         JPTInitializeNetwork(); JPTInstallManagementHook(); JPTInstallMetadataPrompt();
     }

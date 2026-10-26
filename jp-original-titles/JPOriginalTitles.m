@@ -1317,6 +1317,7 @@ static void JPTCacheOriginals(NSDictionary *values) {
 
 
 static BOOL JPTStrictMode(void);
+static BOOL JPTCombineTitles(void);
 
 typedef NS_ENUM(NSInteger, JPTLookupFailure) {
     JPTLookupRejected = 1, JPTLookupExhausted = 2, JPTLookupParseFailure = 3
@@ -2036,7 +2037,8 @@ static void JPTFinishSearch(NSURLSession *session, NSURLRequest *searchRequest, 
                (unsigned long)changes.count);
         for (NSString *change in changes) JPTLog(@"  %@", change);
         // Capture only the payload actually delivered to the client.
-        if (JPTCapturePreviousSearch(payload, patched ?: payload)) deliver(patched ?: payload, nil);
+        NSData *body = patched ?: payload;
+        if (JPTCapturePreviousSearch(payload, body)) deliver((JPTCombineTitles() ? JPTPresentSearchTitles(body) : nil) ?: body, nil);
         else deliver(nil, [NSError errorWithDomain:@"JPOriginalTitles.Storage" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Could not persist name changes"}]);
     };
     NSURLRequest *template = nil;
@@ -2208,7 +2210,8 @@ static void JPTHookDelegate(NSString *name) {
             NSError *failure = !patched || (JPTStrictMode() && !JPTClientMetadataIsValid(payload))
                 ? JPTLookupFailureError(JPTLookupParseFailure, @"Metadata rewrite parse failure") : nil;
             if (JPTBlockDelivery(failure, state.traitTracks)) deliver(nil, failure);
-            else if (JPTCapturePreviousResponse(payload, patched ?: payload)) deliver(patched ?: payload, nil);
+            else if (JPTCapturePreviousResponse(payload, patched ?: payload))
+                deliver((JPTCombineTitles() ? JPTPresentResponseTitles(patched ?: payload) : nil) ?: patched ?: payload, nil);
             else deliver(nil, [NSError errorWithDomain:@"JPOriginalTitles.Storage" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Could not persist name changes"}]);
         };
         NSSet<NSString *> *missing = tracks ? JPTMissingOriginals(tracks, state.traitTracks, originals(), !clientOriginal) : nil;

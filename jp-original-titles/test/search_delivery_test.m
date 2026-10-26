@@ -55,6 +55,14 @@ int main(int argc, const char *argv[]) {
         gOriginalCache = [@{own: Track(@"Kyuseishu", original), original: Track(@"救世主", nil)} mutableCopy];
         Finish(romanized, &data, &error);
         Check(!error && [SearchName(data) isEqualToString:@"救世主"], @"a verified original name is still delivered");
+        atomic_store(&gJPTCombineTitles, true);
+        Finish(romanized, &data, &error);
+        Check(!error && [SearchName(data) isEqualToString:@"救世主\uFF5CKyuseishu"], @"combined search delivery uses the fullwidth bar");
+        Finish(romanized, &data, &error);
+        Check(!error && [SearchName(data) isEqualToString:@"救世主\uFF5CKyuseishu"] && [JPTPreviousFields(own)[@"title"] isEqualToString:@"Kyuseishu"], @"repeated combined delivery keeps the raw stored title");
+        atomic_store(&gJPTCombineTitles, false);
+        Finish(romanized, &data, &error);
+        Check(!error && [SearchName(data) isEqualToString:@"救世主"], @"combined titles off delivers the original name only");
 
         NSString *logPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"jpt-warning-" stringByAppendingString:NSUUID.UUID.UUIDString]];
         setenv("JPT_TEST_LOG_PATH", logPath.UTF8String, 1); atomic_store(&gJPTLogging, true);

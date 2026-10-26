@@ -211,4 +211,60 @@ static BOOL JPTCapturePreviousSearch(NSData *before, NSData *after) {
     if (!after) return YES;
     return JPTPreviousCompare(JPTPreviousSearchCarriers(before), JPTPreviousSearchCarriers(after));
 }
+
+// Display only: stored pairs keep raw names, so the bar is added after capture to titles matching a stored new name.
+static NSString *JPTPresentedTitle(NSString *uri, NSString *title) {
+    if (!JPTPreviousValidURI(uri) || !JPTPreviousHasText(title)) return nil;
+    @synchronized (JPTPreviousLock()) {
+        JPTPreviousLoadLocked();
+        NSDictionary *record = gJPTPreviousMetadataRecords[uri];
+        NSDictionary *fields = [record[@"fields"] isKindOfClass:NSDictionary.class] ? record[@"fields"] : nil;
+        NSDictionary *pair = [fields[@"title"] isKindOfClass:NSDictionary.class] ? fields[@"title"] : nil;
+        NSString *old = pair[@"old"];
+        if (!JPTPreviousHasText(old) || ![pair[@"new"] isEqual:title] || [old isEqual:title]) return nil;
+        return [NSString stringWithFormat:@"%@\uFF5C%@", title, old];
+    }
+}
+
+static NSData *JPTPresentTitleValue(NSString *uri, const uint8_t *p, size_t len) {
+    JPTReader r = JPTReaderMake(p, len); JPTField f; BOOL ok;
+    while (JPTNext(&r, &f, &ok)) {
+        if (f.field != 2 || f.wire != 2) continue;
+        NSString *title = JPTPresentedTitle(uri, JPTString(&f));
+        return title ? JPTReplaceString(p, len, 2, title, NULL) : nil;
+    }
+    return nil;
+}
+
+// TRACK_V4 and IdentityTrait carry the rewritten track titles; nil when nothing changes or parsing fails.
+static NSData *JPTPresentResponseTitles(NSData *body) {
+    NSMutableData *out = [NSMutableData dataWithCapacity:body.length + 256];
+    JPTReader r = JPTReaderMake(body.bytes, body.length); JPTField f; BOOL ok, changed = NO;
+    while (JPTNext(&r, &f, &ok)) {
+        uint64_t kind = (f.field == 2 && f.wire == 2) ? JPTArrayKind(&f) : 0;
+        if (kind != kKindTrackV4 && kind != kKindIdentityTrait) { JPTWriteRaw(out, &f); continue; }
+        NSMutableData *array = [NSMutableData dataWithCapacity:f.len + 256];
+        JPTReader ar = JPTReaderMake(f.data, f.len); JPTField af; BOOL aok;
+        while (JPTNext(&ar, &af, &aok)) {
+            NSString *uri = nil; uint64_t status = 0; JPTField value = {0};
+            NSData *entry = nil;
+            if (af.field == 3 && af.wire == 2 && JPTParseEntry(&af, &uri, &status, &value) && status == 200) {
+                NSData *presented = JPTPresentTitleValue(uri, value.data, value.len);
+                entry = presented ? JPTRewriteEntry(&af, presented) : nil;
+            }
+            if (entry) { JPTWriteData(array, 3, entry); changed = YES; }
+            else JPTWriteRaw(array, &af);
+        }
+        if (!aok) return nil;
+        JPTWriteData(out, 2, array);
+    }
+    return ok && changed ? out : nil;
+}
+
+static NSData *JPTPresentSearchTitles(NSData *body) {
+    if (!JPTIsMessage(body.bytes, body.length)) return nil;
+    return JPTWalkSearch(body.bytes, body.length, 0, ^NSData *(NSString *uri, const uint8_t *p, size_t len) {
+        return [uri hasPrefix:@"spotify:track:"] ? JPTPresentTitleValue(uri, p, len) : nil;
+    });
+}
 #endif
