@@ -569,6 +569,11 @@ static NSString *JPTPick(NSString *client, NSString *original) {
     return (!JPTHasCJK(client) && JPTHasCJK(original)) ? original : client;
 }
 
+// Delivered names change only when a name without CJK text gains CJK text.
+static BOOL JPTUpgradesName(NSString *old, NSString *name) {
+    return name.length && !JPTHasCJK(old) && JPTHasCJK(name);
+}
+
 static JPTTrackInfo *JPTMergeInfo(JPTTrackInfo *client, JPTTrackInfo *original) {
     if (!client) return original;
     if (!original || original == client) return client;
@@ -806,42 +811,56 @@ static NSString *JPTSummary(NSString *name, NSArray<NSString *> *artists) {
     return [NSString stringWithFormat:@"%@ | %@", name, [artists componentsJoinedByString:@", "]];
 }
 
+static NSString *JPTSubString(const JPTField *f, uint32_t field);
+
 static NSData *JPTRewriteIdentity(const JPTField *value, JPTTrackInfo *track, NSString **oldSummary) {
     NSMutableData *out = [NSMutableData dataWithCapacity:value->len + 32];
     JPTReader r = JPTReaderMake(value->data, value->len);
     JPTField f;
     BOOL ok;
     BOOL hadParent = NO;
+    NSMutableData *keptName = [NSMutableData data];
     NSMutableData *keptParent = [NSMutableData data];
-    NSMutableData *keptContributors = [NSMutableData data];
-    NSString *oldName = nil;
+    NSMutableData *renamedContributors = [NSMutableData data];
+    BOOL renamedArtist = NO;
+    NSString *oldName = nil, *oldAlbum = nil;
     NSMutableArray<NSString *> *oldArtists = [NSMutableArray array];
     while (JPTNext(&r, &f, &ok)) {
         if (f.field == 2) {
             oldName = JPTString(&f);
+            JPTWriteRaw(keptName, &f);
             continue;
         }
         if (f.field == 4) {
             hadParent = YES;
+            oldAlbum = JPTSubString(&f, 1);
             JPTWriteRaw(keptParent, &f);
             continue;
         }
         if (f.field == 5) {
-            JPTWriteRaw(keptContributors, &f);
-            JPTReader cr = JPTReaderMake(f.data, f.len);
-            JPTField cf;
-            BOOL cok;
-            while (JPTNext(&cr, &cf, &cok)) {
-                if (cf.field == 1) [oldArtists addObject:JPTString(&cf) ?: @""];
-            }
+            NSString *artistName = JPTSubString(&f, 1), *artistURI = JPTSubString(&f, 2), *name = nil;
+            [oldArtists addObject:artistName ?: @""];
+            for (NSArray<NSString *> *artist in track.artists) if ([artist[1] isEqualToString:artistURI]) name = artist[0];
+            NSData *renamed = JPTUpgradesName(artistName, name) ? JPTReplaceString(f.data, f.len, 1, name, NULL) : nil;
+            if (renamed) { JPTWriteData(renamedContributors, 5, renamed); renamedArtist = YES; }
+            else JPTWriteRaw(renamedContributors, &f);
             continue;
         }
         JPTWriteRaw(out, &f);
     }
     if (!ok) return nil;
     *oldSummary = JPTSummary(oldName, oldArtists);
-    JPTWriteString(out, 2, track.name);
-    if (hadParent && track.albumName.length && track.albumURI.length) {
+    // IdentityTrait is what Spotify displays; keep each name unless it gains CJK text.
+    NSMutableArray<NSString *> *newArtists = [NSMutableArray array];
+    for (NSArray<NSString *> *artist in track.artists) [newArtists addObject:artist[0]];
+    BOOL title = JPTUpgradesName(oldName, track.name);
+    BOOL album = hadParent && track.albumURI.length && JPTUpgradesName(oldAlbum, track.albumName);
+    BOOL artists = track.artists.count && JPTUpgradesName([oldArtists componentsJoinedByString:@", "],
+                                                          [newArtists componentsJoinedByString:@", "]);
+    if (!title && !album && !artists && !renamedArtist) return [NSData dataWithBytes:value->data length:value->len];
+    if (title) JPTWriteString(out, 2, track.name);
+    else [out appendData:keptName];
+    if (album) {
         NSMutableData *parent = [NSMutableData data];
         JPTWriteString(parent, 1, track.albumName);
         JPTWriteString(parent, 2, track.albumURI);
@@ -849,7 +868,7 @@ static NSData *JPTRewriteIdentity(const JPTField *value, JPTTrackInfo *track, NS
     } else {
         [out appendData:keptParent];
     }
-    if (track.artists.count) {
+    if (artists) {
         for (NSArray<NSString *> *artist in track.artists) {
             NSMutableData *contributor = [NSMutableData data];
             JPTWriteString(contributor, 1, artist[0]);
@@ -857,7 +876,8 @@ static NSData *JPTRewriteIdentity(const JPTField *value, JPTTrackInfo *track, NS
             JPTWriteData(out, 5, contributor);
         }
     } else {
-        [out appendData:keptContributors];
+        // A list that already has CJK text still renames each same-URI artist that gains it.
+        [out appendData:renamedContributors];
     }
     return out;
 }
@@ -892,14 +912,17 @@ static BOOL JPTIsMessage(const uint8_t *p, size_t len);
 static NSData *JPTRewriteTrack(const JPTField *value, JPTTrackInfo *preferred) {
     if (!preferred) return nil;
     NSMutableData *out = [NSMutableData dataWithCapacity:value->len];
+    // original_title and version_title form one display title and change together.
+    BOOL pair = preferred.originalTitle.length && JPTUpgradesName(
+        [NSString stringWithFormat:@"%@ %@", JPTSubString(value, 27) ?: @"", JPTSubString(value, 28) ?: @""],
+        [NSString stringWithFormat:@"%@ %@", preferred.originalTitle, preferred.versionTitle ?: @""]);
     JPTReader r = JPTReaderMake(value->data, value->len);
     JPTField f;
     BOOL ok, changed = NO;
     while (JPTNext(&r, &f, &ok)) {
-        if (f.field == 2 && f.wire == 2 && preferred.name.length
-            && ![JPTString(&f) isEqualToString:preferred.name]) {
+        if (f.field == 2 && f.wire == 2 && JPTUpgradesName(JPTString(&f), preferred.name)) {
             JPTWriteString(out, 2, preferred.name); changed = YES;
-        } else if ((f.field == 27 || f.field == 28) && f.wire == 2 && preferred.originalTitle.length) {
+        } else if ((f.field == 27 || f.field == 28) && f.wire == 2 && pair) {
             // The client can reconstruct display names from these instead of field 2.
             NSString *text = f.field == 27 ? preferred.originalTitle : preferred.versionTitle ?: @"";
             if (![JPTString(&f) isEqualToString:text]) { JPTWriteString(out, f.field, text); changed = YES; }
@@ -914,7 +937,7 @@ static NSData *JPTRewriteTrack(const JPTField *value, JPTTrackInfo *preferred) {
                     if ([artist[1] isEqualToString:uri]) { name = artist[0]; break; }
                 }
             }
-            NSData *entity = (parsed && name.length && ![oldName isEqualToString:name])
+            NSData *entity = (parsed && JPTUpgradesName(oldName, name))
                 ? JPTReplaceString(f.data, f.len, 2, name, NULL) : nil;
             if (entity) { JPTWriteData(out, f.field, entity); changed = YES; }
             else JPTWriteRaw(out, &f);
@@ -979,6 +1002,7 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
                 if (!preferred.name.length) preferred = nil;
                 NSString *oldName = nil;
                 NSData *renamed = preferred ? JPTReplaceString(value.data, value.len, 2, preferred.name, &oldName) : nil;
+                if (renamed && !JPTUpgradesName(oldName, preferred.name)) { renamed = nil; preferred = nil; }
                 if (renamed && kind == kKindAlbumV4 && preferred.originalTitle.length)
                     renamed = JPTReplaceString(renamed.bytes, renamed.length, 18, preferred.originalTitle, NULL);
                 if (preferred && !renamed) [changes addObject:[NSString stringWithFormat:@"WARNING album rewrite parse failure %@", uri]];
@@ -1012,6 +1036,7 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
                 // ARTIST_V4, IdentityTrait and SimpleCardTrait (artist page header) keep the name in field 2
                 NSString *name = artistNames[uri], *oldName = nil;
                 NSData *value2 = (parsed && status == 200 && name) ? JPTReplaceString(value.data, value.len, 2, name, &oldName) : nil;
+                if (value2 && !JPTUpgradesName(oldName, name)) { value2 = nil; name = nil; }
                 if (value2 && kind == kKindSimpleCard) {
                     // SimpleCardTrait repeats the title in field 6
                     NSString *oldTitle = nil;
@@ -1039,7 +1064,8 @@ NSData *JPTRewriteResponse(NSData *body, NSSet<NSString *> *added, NSDictionary<
                 NSMutableArray<NSString *> *artists = [NSMutableArray array];
                 for (NSArray<NSString *> *artist in track.artists) [artists addObject:artist[0]];
                 NSString *newSummary = JPTSummary(track.name, artists);
-                if (![oldSummary isEqualToString:newSummary]) {
+                BOOL rewritten = identity.length != value.len || memcmp(identity.bytes, value.data, value.len);
+                if (rewritten && ![oldSummary isEqualToString:newSummary]) {
                     [changes addObject:[NSString stringWithFormat:@"%@: %@ -> %@ / %@", uri, oldSummary, newSummary, track.albumName]];
                 }
             } else {

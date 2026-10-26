@@ -170,6 +170,29 @@ static NSData *Rewrite(NSData *body, NSSet *added, NSDictionary *originals, NSMu
     return JPTRewriteResponse(body, added, originals, names, [NSMutableArray array]);
 }
 
+// IdentityTrait: 1 type label, 2 title, 4 parent {1 name, 2 uri}, 5 contributor {1 name, 2 uri}
+static NSData *IdentityValue(NSString *title, NSString *album, NSString *albumURI, NSArray<NSArray<NSString *> *> *artists) {
+    NSMutableData *data = [NSMutableData data], *parent = [NSMutableData data];
+    JPTWriteString(data, 1, @"歌曲");
+    JPTWriteString(data, 2, title);
+    JPTWriteString(parent, 1, album);
+    JPTWriteString(parent, 2, albumURI);
+    JPTWriteData(data, 4, parent);
+    for (NSArray<NSString *> *artist in artists) {
+        NSMutableData *contributor = [NSMutableData data];
+        JPTWriteString(contributor, 1, artist[0]);
+        JPTWriteString(contributor, 2, artist[1]);
+        JPTWriteData(data, 5, contributor);
+    }
+    return data;
+}
+
+// The client asked for IdentityTrait only, so the paired TRACK_V4 is a helper entry.
+static NSData *IdentityResult(NSString *uri, NSData *own, NSData *identity, NSDictionary *originals, NSMutableDictionary *names) {
+    NSData *body = Response(@[Array(10, @[Entry(uri, own, 200)]), Array(178, @[Entry(uri, identity, 200)])]);
+    return Payload(Rewrite(body, [NSSet setWithObject:uri], originals, names), 178, uri);
+}
+
 int main(void) {
     @autoreleasepool {
         NSString *ownURI = URI(@"track", 10), *originalURI = URI(@"track", 40);
@@ -384,6 +407,64 @@ int main(void) {
               [String(Fields(fixedSearchTrack, 4).firstObject, 1) isEqual:URI(@"artist", 12)] &&
               [String(fixedEntity, 3) isEqual:@"unchanged image URL"],
               @"search path still renames the international track and preserves artist URI and image");
+
+        // Delivered names change only when a name without CJK text gains CJK text.
+        NSString *chineseURI = URI(@"track", 50);
+        NSData *chineseIdentity = IdentityValue(@"你若三冬（将军进行曲） - DJ沈乐版", @"你若三冬（将军进行曲）（DJ沈乐版）",
+                                                URI(@"album", 150), @[@[@"阿悠悠", URI(@"artist", 52)]]);
+        NSData *chineseResult = IdentityResult(chineseURI, Track(50, @"你若三冬（将军进行曲）", @"你若三冬（将军进行曲）", @[@"阿悠悠"], nil),
+                                               chineseIdentity, @{}, [NSMutableDictionary dictionary]);
+        Check([chineseResult isEqual:chineseIdentity], @"Chinese IdentityTrait names are not replaced by other Chinese names");
+
+        NSString *englishURI = URI(@"track", 60);
+        NSData *englishIdentity = IdentityValue(@"Welcome to New York", @"Party Time Hits", URI(@"album", 160),
+                                                @[@[@"Kids Party Music Players", URI(@"artist", 161)],
+                                                  @[@"Party Mix All-Stars", URI(@"artist", 162)]]);
+        NSData *englishResult = IdentityResult(englishURI, Track(60, @"Welcome To New York", @"#swifty", @[@"Swifty"], nil),
+                                               englishIdentity, @{}, [NSMutableDictionary dictionary]);
+        Check([englishResult isEqual:englishIdentity], @"Latin IdentityTrait title, album and artists are not replaced by Latin names");
+
+        NSString *bloomURI = URI(@"track", 70), *lilasURI = URI(@"artist", 72);
+        NSMutableDictionary *bloomNames = [@{lilasURI: @"幾田りら"} mutableCopy];
+        NSData *bloomResult = IdentityResult(bloomURI, Track(70, @"In Bloom", @"In Bloom", @[@"Lilas"], nil),
+                                             IdentityValue(@"百花繚乱", @"百花繚乱", URI(@"album", 170), @[@[@"Lilas", lilasURI]]),
+                                             @{}, bloomNames);
+        NSData *bloomParent = Fields(bloomResult, 4).firstObject, *bloomArtist = Fields(bloomResult, 5).firstObject;
+        Check([String(bloomResult, 2) isEqual:@"百花繚乱"] && [String(bloomParent, 1) isEqual:@"百花繚乱"] &&
+              [String(bloomParent, 2) isEqual:URI(@"album", 170)],
+              @"Japanese IdentityTrait title and album are not downgraded to English");
+        Check([String(bloomArtist, 1) isEqual:@"幾田りら"] && [String(bloomArtist, 2) isEqual:lilasURI],
+              @"a Latin IdentityTrait artist still gains its Japanese name");
+
+        NSString *mixedURI = URI(@"track", 110);
+        NSData *mixedResult = IdentityResult(mixedURI, Track(110, @"ボカロ曲", @"アルバム", @[@"初音ミク produced by ワカバ", @"初音ミク"], nil),
+                                             IdentityValue(@"ボカロ曲", @"アルバム", URI(@"album", 111),
+                                                           @[@[@"初音ミク produced by ワカバ", URI(@"artist", 112)], @[@"Hatsune Miku", URI(@"artist", 113)]]),
+                                             @{}, [NSMutableDictionary dictionary]);
+        NSArray<NSData *> *mixedArtists = Fields(mixedResult, 5);
+        Check(mixedArtists.count == 2 && [String(mixedArtists[0], 1) isEqual:@"初音ミク produced by ワカバ"] &&
+              [String(mixedArtists[1], 1) isEqual:@"初音ミク"] && [String(mixedArtists[1], 2) isEqual:URI(@"artist", 113)] &&
+              [String(mixedResult, 2) isEqual:@"ボカロ曲"],
+              @"an artist list that already has CJK text still renames the same-URI Latin artist");
+
+        NSString *romanURI = URI(@"track", 80);
+        NSData *romanResult = IdentityResult(romanURI, Track(80, @"救世主", @"救世主", @[@"ツクヨミ"], nil),
+                                             IdentityValue(@"Kyuseishu", @"Kyuseishu", URI(@"album", 180), @[@[@"Tsukuyomi", URI(@"artist", 82)]]),
+                                             @{}, [NSMutableDictionary dictionary]);
+        NSData *romanParent = Fields(romanResult, 4).firstObject, *romanArtist = Fields(romanResult, 5).firstObject;
+        Check([String(romanResult, 2) isEqual:@"救世主"] && [String(romanParent, 1) isEqual:@"救世主"] &&
+              [String(romanParent, 2) isEqual:URI(@"album", 81)] && [String(romanArtist, 1) isEqual:@"ツクヨミ"],
+              @"romanized IdentityTrait still receives the Japanese title, album and artist");
+
+        NSString *adoptedURI = URI(@"track", 90), *adoptedOriginalURI = URI(@"track", 100);
+        NSData *adoptedOwn = Track(90, @"Hyakka Ryouran", @"Hyakka Album", @[@"Lilas"], adoptedOriginalURI);
+        NSDictionary *adoptedOriginals = JPTCollectTracks(Response(@[Array(10, @[Entry(adoptedOriginalURI,
+            Track(100, @"百花繚乱", @"Laugh", @[@"幾田りら"], nil), 200)])]));
+        NSData *adoptedValue = Payload(Rewrite(Response(@[Array(10, @[Entry(adoptedURI, adoptedOwn, 200)])]), [NSSet set],
+                                               adoptedOriginals, [NSMutableDictionary dictionary]), 10, adoptedURI);
+        Check([String(adoptedValue, 2) isEqual:@"百花繚乱"] && [String(Fields(adoptedValue, 3).firstObject, 2) isEqual:@"Hyakka Album"] &&
+              [String(Fields(adoptedValue, 4).firstObject, 2) isEqual:@"幾田りら"],
+              @"TRACK_V4 adopts the Japanese title and artist but keeps a Latin album over another Latin album");
         printf("%lu checks, %lu failures\n", (unsigned long)checks, (unsigned long)failures);
         return failures ? 1 : 0;
     }
