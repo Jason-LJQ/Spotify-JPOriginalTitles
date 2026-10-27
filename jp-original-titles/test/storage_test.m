@@ -19,11 +19,12 @@ int main(int argc, const char **argv) { @autoreleasepool {
         setenv("JPT_TEST_DATABASE_PATH",argv[1],1);
         Check([JPTArtistNamesSnapshot()[@"spotify:artist:a"] isEqual:@"Artist"], @"fresh process loads committed artist");
         Check([JPTPreviousFields(@"spotify:track:t")[@"title"] isEqual:@"Raw"], @"fresh process loads committed previous field");
+        Check([JPTCreditArtistNamesSnapshot()[@"spotify:artist:c"] isEqual:@"芸人"], @"fresh process loads committed credit artist name");
         return 0;
     }
     NSString *path = JPTStoragePath();
     Check(JPTStorageOpen(), @"database opens in plugin directory");
-    Check(Count(@"SELECT count(*) FROM sqlite_master WHERE type='table'")==2, @"exactly two independent tables");
+    Check(Count(@"SELECT count(*) FROM sqlite_master WHERE type='table'")==3, @"exactly three independent tables");
     Check(Count(@"PRAGMA synchronous")==2, @"FULL synchronous durability");
     Check(JPTStorageClear(), @"clear both tables in one transaction");
     sqlite3_trace_v2(gJPTStore, SQLITE_TRACE_STMT, Trace, NULL);
@@ -42,7 +43,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     changes = sqlite3_total_changes(gJPTStore);
     JPTPreviousCompare(Carrier(@"spotify:track:two",@"Official"), Carrier(@"spotify:track:two",@"Official"));
     Check(sqlite3_total_changes(gJPTStore)==changes+1 && Count(@"SELECT count(*) FROM previous_fields")==1, @"invalidated field deletes only its row");
-    Check([JPTStorageSummary() containsString:@"1 artist names"] && [JPTStorageSummary() containsString:@"1 previous fields / 1 tracks"], @"management statistics read persisted row counts");
+    Check([JPTStorageSummary() containsString:@"1 artist names"] && [JPTStorageSummary() containsString:@"0 credit artists"] && [JPTStorageSummary() containsString:@"1 previous fields / 1 tracks"], @"management statistics read persisted row counts");
     sqlite3_exec(gJPTStore,"CREATE TRIGGER reject_previous BEFORE INSERT ON previous_fields BEGIN SELECT RAISE(ABORT,'fixture'); END",NULL,NULL,NULL);
     JPTMergeArtistNames(@{@"spotify:artist:b":@"Second"});
     Check(!JPTPreviousCompare(Carrier(@"spotify:track:failed",@"Raw"),Carrier(@"spotify:track:failed",@"New")), @"failed transaction rejects delivery");
@@ -50,8 +51,14 @@ int main(int argc, const char **argv) { @autoreleasepool {
     Check(!JPTPreviousFields(@"spotify:track:failed").count, @"uncommitted previous field never published to memory");
     Check(gJPTDirtyArtists.count==1, @"failed artist row remains staged for next successful delivery");
     sqlite3_exec(gJPTStore,"DROP TRIGGER reject_previous",NULL,NULL,NULL);
+    sqlite3_exec(gJPTStore,"CREATE TRIGGER reject_credits BEFORE INSERT ON credit_artist_names BEGIN SELECT RAISE(ABORT,'fixture'); END",NULL,NULL,NULL);
+    JPTMergeCreditArtistNames(@{@"spotify:artist:c":@"芸人"});
+    Check(!JPTPreviousCompare(Carrier(@"spotify:track:failed",@"Raw"),Carrier(@"spotify:track:failed",@"New")) && Count(@"SELECT count(*) FROM artist_names")==1
+        && Count(@"SELECT count(*) FROM credit_artist_names")==0 && gJPTDirtyCreditArtists.count==1, @"credit name write failure rolls back the whole response and stays staged");
+    sqlite3_exec(gJPTStore,"DROP TRIGGER reject_credits",NULL,NULL,NULL);
     Check(JPTPreviousCompare(Carrier(@"spotify:track:failed",@"Raw"),Carrier(@"spotify:track:failed",@"New")), @"new successful response can commit after rollback");
-    Check(Count(@"SELECT count(*) FROM artist_names")==2 && Count(@"SELECT count(*) FROM previous_fields")==2, @"retry commits both rows");
+    Check(Count(@"SELECT count(*) FROM artist_names")==2 && Count(@"SELECT count(*) FROM previous_fields")==2
+        && Count(@"SELECT count(*) FROM credit_artist_names")==1 && !gJPTDirtyCreditArtists.count, @"retry commits all staged rows");
     sqlite3 *reader = NULL; sqlite3_open(path.fileSystemRepresentation,&reader);
     sqlite3_exec(reader,"BEGIN; SELECT * FROM artist_names",NULL,NULL,NULL);
     sqlite3_busy_timeout(gJPTStore,10);
@@ -69,7 +76,8 @@ int main(int argc, const char **argv) { @autoreleasepool {
     Check(Count(@"SELECT count(*) FROM previous_fields")==64 && JPTPreviousRecordCount()==64, @"parallel responses preserve all independent rows");
     gJPTPreviousMetadataRecords=nil; Check(JPTPreviousRecordCount()==64, @"parallel data survives memory reload");
     Check(JPTStorageClear(), @"explicit reset succeeds"); gJPTPreviousMetadataRecords=nil;
-    Check(!JPTPreviousRecordCount() && !JPTArtistNamesSnapshot().count, @"reset clears both persistent and reloaded memory stores");
+    Check(!JPTPreviousRecordCount() && !JPTArtistNamesSnapshot().count && !JPTCreditArtistNamesSnapshot().count
+        && !Count(@"SELECT count(*) FROM credit_artist_names"), @"reset clears all persistent and reloaded memory stores");
     sqlite3_stmt *integrity = NULL; sqlite3_prepare_v2(gJPTStore,"PRAGMA integrity_check",-1,&integrity,NULL);
     Check(sqlite3_step(integrity)==SQLITE_ROW && [JPTStorageString(integrity,0) isEqual:@"ok"], @"database integrity after rollback and concurrent writes");
     sqlite3_finalize(integrity);

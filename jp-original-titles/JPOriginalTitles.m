@@ -1344,6 +1344,7 @@ static void JPTCacheOriginals(NSDictionary *values) {
 
 static BOOL JPTStrictMode(void);
 static BOOL JPTCombineTitles(void);
+static BOOL JPTCombineCreditArtists(void);
 
 typedef NS_ENUM(NSInteger, JPTLookupFailure) {
     JPTLookupRejected = 1, JPTLookupExhausted = 2, JPTLookupParseFailure = 3
@@ -2195,7 +2196,7 @@ static void JPTHookDelegate(NSString *name) {
         NSData *payload = state.buffer;
         NSInteger statusCode = [task.response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)task.response).statusCode : 0;
         void (^deliver)(NSData *, NSError *) = ^(NSData *data, NSError *lookupError) {
-            if (!lookupError && !error && statusCode == 200 && state.credits) data = JPTNativeCreditsResponse(data);
+            if (!lookupError && !error && statusCode == 200 && state.credits) data = JPTNativeCreditsResponse(data, JPTCombineCreditArtists());
             if (!lookupError && data.length) origReceive(self, receiveSel, session, (NSURLSessionDataTask *)task, data);
             origComplete(self, completeSel, session, task, lookupError ?: error);
         };

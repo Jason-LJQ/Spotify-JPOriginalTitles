@@ -13,8 +13,8 @@ static NSString *const kJPTLoggingKey = @"JPOriginalTitlesLoggingEnabled";
 static NSString *const kJPTResetRequestKey = @"JPOriginalTitlesResetRequest";
 static NSString *const kJPTLastResetKey = @"JPOriginalTitlesLastReset";
 static NSString *const kJPTMetadataPromptKey = @"JPOriginalTitlesMetadataPromptOffered";
-static NSString *const kJPTBuild = @"v7.1.1";
-static NSString *const kJPTBuildID = @"20261025-v711";
+static NSString *const kJPTBuild = @"v7.2";
+static NSString *const kJPTBuildID = @"20261026-v72";
 static const NSUInteger kJPTLogLimit = 1024 * 1024;
 static atomic_bool gJPTLogging;
 static atomic_bool gJPTStrict;
@@ -34,6 +34,16 @@ static void JPTLoadCombineTitles(NSUserDefaults *defaults) {
 }
 static void JPTSetCombineTitles(NSUserDefaults *defaults, BOOL enabled) {
     [defaults setBool:enabled forKey:kJPTCombineTitlesKey]; [defaults synchronize]; atomic_store(&gJPTCombineTitles, enabled);
+}
+static atomic_bool gJPTCombineCreditArtists;
+static NSString *const kJPTCombineCreditArtistsKey = @"JPOriginalTitlesCombineCreditArtists";
+static BOOL JPTCombineCreditArtists(void) { return atomic_load(&gJPTCombineCreditArtists); }
+// Credits artist names also default to new｜old.
+static void JPTLoadCombineCreditArtists(NSUserDefaults *defaults) {
+    atomic_store(&gJPTCombineCreditArtists, [defaults objectForKey:kJPTCombineCreditArtistsKey] ? [defaults boolForKey:kJPTCombineCreditArtistsKey] : YES);
+}
+static void JPTSetCombineCreditArtists(NSUserDefaults *defaults, BOOL enabled) {
+    [defaults setBool:enabled forKey:kJPTCombineCreditArtistsKey]; [defaults synchronize]; atomic_store(&gJPTCombineCreditArtists, enabled);
 }
 static BOOL gJPTManagementHookInstalled;
 
@@ -161,6 +171,7 @@ static NSString *JPTDiagnosticSummary(void) {
     }
     [lines addObject:JPTStrictSummary()];
     [lines addObject:[NSString stringWithFormat:@"Combined titles: %@", JPTCombineTitles() ? @"on" : @"off"]];
+    [lines addObject:[NSString stringWithFormat:@"Combined Credits artists: %@", JPTCombineCreditArtists() ? @"on" : @"off"]];
     [lines addObject:[NSString stringWithFormat:@"Logging: %@", atomic_load(&gJPTLogging) ? @"on" : @"off"]];
     [lines addObject:JPTStorageSummary()];
     [lines addObject:[@"Plugin database: " stringByAppendingString:JPTStoragePath()]];
@@ -406,8 +417,8 @@ static void JPTInstallMetadataPrompt(void) {
     [self.tableView reloadData];
 }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 4; }
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return section == 0 ? 4 : section == 1 ? 4 : section == 2 ? 3 : 1; }
-- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section { return @[@"Status", @"Diagnostics", @"Reset Options", @"Title Display"][section]; }
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return section == 0 ? 4 : section == 1 ? 4 : section == 2 ? 3 : 2; }
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section { return @[@"Status", @"Diagnostics", @"Reset Options", @"Name Display"][section]; }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 1) return @"Logging is off by default. Logs may include track names and URIs. No authentication tokens or full responses are recorded. Two log files are retained, up to 1 MB each.";
     if (section == 2) return @"Select independent reset options, then tap Apply. Apply saves the request and closes the app immediately. Reopen Spotify to complete the reset. Metadata reset requires online resync and may discard unsynced offline changes. Playback resume reset deletes the saved queue and position without a backup. Select both metadata and playback resume resets to fix stale restored titles. Login, settings and audio files are kept.";
@@ -445,6 +456,12 @@ static void JPTInstallMetadataPrompt(void) {
             UISwitch *toggle = [UISwitch new]; toggle.on = JPTStrictMode(); toggle.accessibilityIdentifier = @"jpt.strict";
             [toggle addTarget:self action:@selector(strictChanged:) forControlEvents:UIControlEventValueChanged]; cell.accessoryView = toggle;
         } else cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    } else if (index.section == 3 && index.row == 1) {
+        cell.textLabel.text = @"Show Original and Previous Artist Names in Credits";
+        cell.detailTextLabel.text = @"Show renamed Credits artists as Original name\uFF5CPrevious name. Turn off to show only the original name.";
+        cell.accessibilityIdentifier = @"jpt.combineCreditArtists";
+        UISwitch *toggle = [UISwitch new]; toggle.on = JPTCombineCreditArtists(); toggle.accessibilityIdentifier = @"jpt.combineCreditArtists";
+        [toggle addTarget:self action:@selector(combineCreditArtistsChanged:) forControlEvents:UIControlEventValueChanged]; cell.accessoryView = toggle;
     } else if (index.section == 3) {
         cell.textLabel.text = @"Show Original and Previous Song Titles";
         cell.detailTextLabel.text = @"Show changed songs as Original title\uFF5CPrevious title. Turn off to show only the original title.";
@@ -482,6 +499,12 @@ static void JPTInstallMetadataPrompt(void) {
     // Cached titles keep the previous display; preselect the metadata reset but leave Apply to the user.
     self.resetMetadata = YES; [self refresh];
     [self message:@"Title Display Changed" body:@"New titles use this setting now. Titles cached by Spotify keep the previous display until its metadata is reset. Reset Spotify Metadata is selected: tap Apply to reset, or deselect it to keep the cache."];
+}
+- (void)combineCreditArtistsChanged:(UISwitch *)toggle {
+    JPTSetCombineCreditArtists([NSUserDefaults standardUserDefaults], toggle.on);
+    // Spotify caches Credits like titles; preselect the metadata reset but leave Apply to the user.
+    self.resetMetadata = YES; [self refresh];
+    [self message:@"Credits Display Changed" body:@"New Credits use this setting now. Credits cached by Spotify keep the previous display until its metadata is reset. Reset Spotify Metadata is selected: tap Apply to reset, or deselect it to keep the cache."];
 }
 - (void)apply {
     if (!self.resetPlugin && !self.resetMetadata && !self.resetPlayback) return;
@@ -646,6 +669,7 @@ __attribute__((constructor)) static void JPTInit(void) {
         atomic_store(&gJPTLogging, [[NSUserDefaults standardUserDefaults] boolForKey:kJPTLoggingKey]);
         JPTLoadStrictMode([NSUserDefaults standardUserDefaults]);
         JPTLoadCombineTitles([NSUserDefaults standardUserDefaults]);
+        JPTLoadCombineCreditArtists([NSUserDefaults standardUserDefaults]);
         JPTProcessReset(JPTUsersPath(), [NSUserDefaults standardUserDefaults]);
         JPTInitializeNetwork(); JPTInstallManagementHook(); JPTInstallMetadataPrompt();
     }

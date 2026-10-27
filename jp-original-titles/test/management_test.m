@@ -44,6 +44,11 @@ int main(void) { @autoreleasepool {
     atomic_store(&gJPTCombineTitles, true); JPTLoadCombineTitles(defaults); Check(!JPTCombineTitles(), @"combined titles opt-out persists");
     Check(![defaults objectForKey:kJPTResetRequestKey], @"title setting alone saves no reset request");
     JPTSetCombineTitles(defaults, YES); Check(JPTCombineTitles(), @"combined titles turn on");
+    JPTLoadCombineCreditArtists(defaults); Check(JPTCombineCreditArtists(), @"combined Credits artists default on");
+    JPTSetCombineCreditArtists(defaults, NO); Check(!JPTCombineCreditArtists(), @"combined Credits artists turn off immediately");
+    atomic_store(&gJPTCombineCreditArtists, true); JPTLoadCombineCreditArtists(defaults); Check(!JPTCombineCreditArtists(), @"combined Credits artists opt-out persists");
+    Check(JPTCombineTitles() && ![defaults objectForKey:kJPTResetRequestKey], @"Credits artist setting is independent of titles and saves no reset request");
+    JPTSetCombineCreditArtists(defaults, YES); Check(JPTCombineCreditArtists(), @"combined Credits artists turn on");
     Check(JPTMetadataPromptRequired(defaults), @"fresh version offers reset");
     [defaults setBool:YES forKey:kJPTMetadataPromptKey]; Check(JPTMetadataPromptRequired(defaults), @"legacy boolean does not suppress new version prompt");
     [defaults setObject:@"v7" forKey:kJPTMetadataPromptKey]; Check(JPTMetadataPromptRequired(defaults), @"older plugin version prompts again");

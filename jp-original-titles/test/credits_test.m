@@ -47,13 +47,29 @@ static NSArray *Rows(NSData *value) {
     }
     return rows;
 }
+static NSData *Credits(NSData *body) { return JPTNativeCreditsResponse(body, YES); }
+static NSData *Person(NSString *name, NSString *uri) {
+    NSMutableData *d = [NSMutableData data]; JPTWriteString(d, 1, name); JPTWriteString(d, 2, @"Performer");
+    if (uri) JPTWriteString(d, 3, uri);
+    JPTWriteString(d, 4, @"reference opaque"); JPTWriteData(d, 6, Text(1, @"Performers")); JPTWriteString(d, 55, @"contributor-unknown");
+    return d;
+}
+static NSData *Identity(NSArray *artists) {
+    NSMutableData *v = [NSMutableData data]; JPTWriteString(v, 2, @"Title");
+    for (NSArray *artist in artists) { NSMutableData *a = [NSMutableData data]; JPTWriteString(a, 1, artist[0]); JPTWriteString(a, 2, artist[1]); JPTWriteData(v, 5, a); }
+    return v;
+}
+static NSUInteger StoredCredits(void) {
+    sqlite3_stmt *stmt = NULL; sqlite3_prepare_v2(gJPTStore, "SELECT count(*) FROM credit_artist_names", -1, &stmt, NULL);
+    NSUInteger n = sqlite3_step(stmt) == SQLITE_ROW ? (NSUInteger)sqlite3_column_int64(stmt, 0) : 0; sqlite3_finalize(stmt); return n;
+}
 static void Seed(NSDictionary *fields) { gJPTPreviousMetadataRecords=[@{@"spotify:track:target":@{@"fields":fields,@"touched":@1}} mutableCopy]; }
 static NSDictionary *Pair(NSString *a, NSString *b) {return @{@"old":a,@"new":b};}
 int main(void) { @autoreleasepool {
     NSString *uri=@"spotify:track:target";
     Seed(@{@"title":Pair(@"Kyuseishu",@"救世主"),@"artists":Pair(@"Artist A, Artist B",@"歌手A, 歌手B"),@"album":Pair(@"Album",@"アルバム")});
     NSMutableData *official=[NSMutableData data];JPTWriteData(official,1,Contributor(@"Official Author",@"Writer",YES));JPTWriteString(official,2,@"source opaque");JPTWriteString(official,77,@"credits-unknown");
-    NSData *before=Response(@[Entry(official,uri,200)],186),*after=JPTNativeCreditsResponse(before);
+    NSData *before=Response(@[Entry(official,uri,200)],186),*after=Credits(before);
     NSArray *rows=Rows(Values(after)[0]);
     Check(rows.count==4,@"three changed dimensions create three native rows");
     Check([rows[0] isEqual:@[@"Writer",@"Official Author",@""]],@"official contributor preserved");
@@ -63,30 +79,69 @@ int main(void) { @autoreleasepool {
     NSData *value=Values(after)[0];Check([[value subdataWithRange:NSMakeRange(0,official.length)] isEqual:official],@"official credits and unknown bytes are unchanged prefix");
     NSMutableData *expected=[official mutableCopy];for(NSArray *row in [rows subarrayWithRange:NSMakeRange(1,3)]) { NSMutableData *c=[NSMutableData data];JPTWriteString(c,1,row[1]);JPTWriteString(c,2,row[2]);JPTWriteData(c,6,Text(1,row[0]));JPTWriteData(expected,1,c); }
     Check([after isEqual:Response(@[Entry(expected,uri,200)],186)],@"outer entry Any and unknown fields preserved");
-    Check([JPTNativeCreditsResponse(after) isEqual:after],@"second pass is byte-identical");
-    Check([JPTNativeCreditsResponse(Response(@[Entry(official,uri,200)],178)) isEqual:Response(@[Entry(official,uri,200)],178)],@"other kind unchanged");
-    for(NSNumber *status in @[@204,@304,@404,@500]){NSData *d=Response(@[Entry(official,uri,status.unsignedLongLongValue)],186);Check([JPTNativeCreditsResponse(d)isEqual:d],[NSString stringWithFormat:@"status %@ unchanged",status]);}
-    for(NSString *other in @[@"spotify:track:other",@"spotify:album:target",@"spotify:artist:target"]){NSData *d=Response(@[Entry(official,other,200)],186);Check([JPTNativeCreditsResponse(d)isEqual:d],[NSString stringWithFormat:@"unrelated URI %@ unchanged",other]);}
+    Check([Credits(after) isEqual:after],@"second pass is byte-identical");
+    Check([Credits(Response(@[Entry(official,uri,200)],178)) isEqual:Response(@[Entry(official,uri,200)],178)],@"other kind unchanged");
+    for(NSNumber *status in @[@204,@304,@404,@500]){NSData *d=Response(@[Entry(official,uri,status.unsignedLongLongValue)],186);Check([Credits(d)isEqual:d],[NSString stringWithFormat:@"status %@ unchanged",status]);}
+    for(NSString *other in @[@"spotify:track:other",@"spotify:album:target",@"spotify:artist:target"]){NSData *d=Response(@[Entry(official,other,200)],186);Check([Credits(d)isEqual:d],[NSString stringWithFormat:@"unrelated URI %@ unchanged",other]);}
     Seed(@{@"title":Pair(@"same",@"same"),@"artists":Pair(@"",@"New"),@"album":Pair(@"   ",@"New")});
-    Check([JPTNativeCreditsResponse(before)isEqual:before],@"unchanged empty whitespace values hidden");
+    Check([Credits(before)isEqual:before],@"unchanged empty whitespace values hidden");
     Seed(@{@"title":Pair(@"Old (Live) 日本語",@"新しい名")});
-    Check(Rows(Values(JPTNativeCreditsResponse(before))[0]).count==2,@"only actual changed dimension is added");
+    Check(Rows(Values(Credits(before))[0]).count==2,@"only actual changed dimension is added");
     Seed(@{@"title":Pair(@"Kyuseishu",@"救世主"),@"album":Pair(@"Kyuseishu",@"救世主")});
-    NSArray *equalRows=Rows(Values(JPTNativeCreditsResponse(before))[0]);
+    NSArray *equalRows=Rows(Values(Credits(before))[0]);
     Check(equalRows.count==3 && [equalRows[1][1] isEqual:equalRows[2][1]] && ![equalRows[1][2] isEqual:equalRows[2][2]],@"identical previous title and album have distinct native roles");
-    Seed(@{});Check([JPTNativeCreditsResponse(before)isEqual:before],@"missing record unchanged");
+    Seed(@{});Check([Credits(before)isEqual:before],@"missing record unchanged");
     Seed(@{@"title":Pair(@"Kyuseishu",@"救世主")});
     NSMutableData *collision=[official mutableCopy];JPTWriteData(collision,1,Contributor(@"Kyuseishu",@"Title",YES));
-    Check(Rows(Values(JPTNativeCreditsResponse(Response(@[Entry(collision,uri,200)],186)))[0]).count==3,@"navigable official collision is not treated as prototype row");
+    Check(Rows(Values(Credits(Response(@[Entry(collision,uri,200)],186)))[0]).count==3,@"navigable official collision is not treated as prototype row");
     const uint8_t invalid[]={0x0a,0x80};NSData *bad=[NSData dataWithBytes:invalid length:sizeof(invalid)];
-    NSData *badEntry=Response(@[Entry(bad,uri,200)],186);Check([JPTNativeCreditsResponse(badEntry)isEqual:badEntry],@"malformed credits retained");
-    NSMutableData *badOuter=[before mutableCopy];[badOuter appendData:bad];Check([JPTNativeCreditsResponse(badOuter)isEqual:badOuter],@"malformed outer response rolls back all edits");
-    NSMutableData *badWrapper=[Entry(official,uri,200) mutableCopy];JPTWriteData(badWrapper,3,bad);NSData *bw=Response(@[badWrapper],186);Check([JPTNativeCreditsResponse(bw)isEqual:bw],@"ambiguous malformed Any wrapper retained");
-    NSData *mixed=Response(@[Entry(official,uri,200),Entry(bad,uri,200),Entry(official,@"spotify:track:other",200)],186);NSArray *mv=Values(JPTNativeCreditsResponse(mixed));Check(mv.count==3&&[mv[1]isEqual:bad]&&[mv[2]isEqual:official]&&Rows(mv[0]).count==2,@"malformed sibling cannot damage valid or unrelated entries");
+    NSData *badEntry=Response(@[Entry(bad,uri,200)],186);Check([Credits(badEntry)isEqual:badEntry],@"malformed credits retained");
+    NSMutableData *badOuter=[before mutableCopy];[badOuter appendData:bad];Check([Credits(badOuter)isEqual:badOuter],@"malformed outer response rolls back all edits");
+    NSMutableData *badWrapper=[Entry(official,uri,200) mutableCopy];JPTWriteData(badWrapper,3,bad);NSData *bw=Response(@[badWrapper],186);Check([Credits(bw)isEqual:bw],@"ambiguous malformed Any wrapper retained");
+    NSData *mixed=Response(@[Entry(official,uri,200),Entry(bad,uri,200),Entry(official,@"spotify:track:other",200)],186);NSArray *mv=Values(Credits(mixed));Check(mv.count==3&&[mv[1]isEqual:bad]&&[mv[2]isEqual:official]&&Rows(mv[0]).count==2,@"malformed sibling cannot damage valid or unrelated entries");
     NSMutableData *query=[NSMutableData data],*entity=[NSMutableData data],*request=[NSMutableData data];JPTWriteVarint(query,8);JPTWriteVarint(query,186);JPTWriteString(entity,1,uri);JPTWriteData(entity,2,query);JPTWriteData(request,2,entity);
     Check(JPTRequestHasCredits(request),@"credits request detected");
     [request appendData:bad];Check(!JPTRequestHasCredits(request),@"malformed request does not match");
     Check(!JPTRequestHasCredits([NSData data]),@"empty request does not match");
-    Check(JPTNativeCreditsResponse(nil)==nil,@"nil response retained");
+    Check(Credits(nil)==nil,@"nil response retained");
+    // Credits contributors take the delivered IdentityTrait name of the same artist URI.
+    JPTStorageClear(); Seed(@{});
+    NSString *tanaka=@"spotify:artist:tanaka", *other=@"spotify:artist:other", *jp=@"spotify:artist:jp", *gone=@"spotify:artist:gone";
+    NSData *rawIdentity=Response(@[Entry(Identity(@[@[@"Nozomu Tanaka",tanaka],@[@"Other",other],@[@"既存",jp]]),uri,200)],178);
+    NSData *newIdentity=Response(@[Entry(Identity(@[@[@"田中 望",tanaka],@[@"Other B",other],@[@"既存の名",jp]]),uri,200)],178);
+    Check(JPTCapturePreviousResponse(rawIdentity,newIdentity),@"IdentityTrait capture commits");
+    NSDictionary *stored=JPTCreditArtistNamesSnapshot();
+    Check(stored.count==1&&[stored[tanaka] isEqual:@"田中 望"]&&StoredCredits()==1,@"only same-URI names that gain CJK text are stored durably");
+    NSData *moved=Response(@[Entry(Identity(@[@[@"Other",other],@[@"Nozomu Tanaka",gone]]),@"spotify:track:moved",200)],178);
+    NSData *movedNew=Response(@[Entry(Identity(@[@[@"田中",gone],@[@"他",other]]),@"spotify:track:moved",200)],178);
+    NSData *shorter=Response(@[Entry(Identity(@[@[@"Gone",gone],@[@"Other",other]]),@"spotify:track:short",200)],178);
+    NSData *shorterNew=Response(@[Entry(Identity(@[@[@"消えた",gone]]),@"spotify:track:short",200)],178);
+    NSData *missing=Response(@[Entry(Identity(@[@[@"Gone",gone]]),@"spotify:track:missing",200)],178);
+    JPTCapturePreviousResponse(moved,movedNew); JPTCapturePreviousResponse(shorter,shorterNew);
+    JPTCapturePreviousResponse(missing,Response(@[],178));
+    JPTCapturePreviousResponse(Response(@[Entry(Identity(@[@[@"Gone",gone]]),uri,404)],178),Response(@[Entry(Identity(@[@[@"消えた",gone]]),uri,404)],178));
+    JPTCapturePreviousResponse(Response(@[Entry(Identity(@[@[@"Gone",gone]]),uri,200)],10),Response(@[Entry(Identity(@[@[@"消えた",gone]]),uri,200)],10));
+    Check(JPTCreditArtistNamesSnapshot().count==1&&StoredCredits()==1,@"different position URI, artist count, missing entry, status and kind are not stored");
+    NSMutableData *credits=[NSMutableData data];
+    NSData *tanakaRow=Person(@"NOZOMU TANAKA",tanaka),*plain=Person(@"NOZOMU TANAKA",nil),*unknown=Person(@"Other",other),*already=Person(@"田中",tanaka);
+    for(NSData *row in @[tanakaRow,plain,unknown,already]) JPTWriteData(credits,1,row);
+    JPTWriteString(credits,2,@"source opaque");
+    NSData *creditsResponse=Response(@[Entry(credits,@"spotify:track:anywhere",200)],186);
+    NSData *(^Expected)(NSString *)=^NSData *(NSString *name){
+        NSMutableData *v=[NSMutableData data]; JPTWriteData(v,1,JPTReplaceString(tanakaRow.bytes,tanakaRow.length,1,name,NULL));
+        for(NSData *row in @[plain,unknown,already]) JPTWriteData(v,1,row);
+        JPTWriteString(v,2,@"source opaque"); return Response(@[Entry(v,@"spotify:track:anywhere",200)],186);
+    };
+    NSData *plainOut=JPTNativeCreditsResponse(creditsResponse,NO),*barOut=JPTNativeCreditsResponse(creditsResponse,YES);
+    Check([plainOut isEqual:Expected(@"田中 望")],@"bar off: only the matching contributor name changes; role, URI, reference, group, unknown fields and sources stay");
+    Check([barOut isEqual:Expected(@"田中 望\uFF5CNOZOMU TANAKA")],@"bar on: renamed contributor shows new｜Credits name");
+    Check([JPTNativeCreditsResponse(plainOut,NO) isEqual:plainOut]&&[JPTNativeCreditsResponse(barOut,YES) isEqual:barOut],@"rename second pass is byte-identical");
+    Check([JPTNativeCreditsResponse(barOut,NO) isEqual:barOut]&&[JPTNativeCreditsResponse(plainOut,YES) isEqual:plainOut],@"names with CJK text are never renamed again");
+    NSData *noMatch=Response(@[Entry(official,@"spotify:track:anywhere",200)],186);
+    Check([JPTNativeCreditsResponse(noMatch,YES) isEqual:noMatch],@"credits without a stored URI are unchanged");
+    Seed(@{@"title":Pair(@"Kyuseishu",@"救世主")});
+    NSArray *both=Rows(Values(JPTNativeCreditsResponse(Response(@[Entry(credits,uri,200)],186),YES))[0]);
+    Check(both.count==5&&[both[0][1] isEqual:@"田中 望\uFF5CNOZOMU TANAKA"]&&[both[4] isEqual:@[@"Original Metadata",@"Kyuseishu",@"Title"]],@"rename and Original Metadata rows apply together");
+    Check(JPTStorageClear()&&!JPTCreditArtistNamesSnapshot().count&&!StoredCredits()&&[JPTNativeCreditsResponse(creditsResponse,YES) isEqual:creditsResponse],@"plugin reset clears credit artist names");
     printf("%d checks passed\n",passed);
 } return 0; }

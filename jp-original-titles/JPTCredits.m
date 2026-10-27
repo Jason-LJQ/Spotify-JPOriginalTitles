@@ -1,4 +1,4 @@
-// Adds previous metadata to the existing Credits Contributor/RoleGroup schema.
+// Renames same-URI contributors and adds previous metadata to the existing Credits Contributor/RoleGroup schema.
 #ifndef JPT_NATIVE_CREDITS
 #define JPT_NATIVE_CREDITS
 static const uint64_t kJPTNativeCreditsKind = 186;
@@ -42,14 +42,17 @@ static BOOL JPTNativeCreditsEntryValid(const JPTField *entry) {
     return ok && headers == 1 && uris == 1 && anys == 1 && values == 1;
 }
 
-static NSData *JPTNativeCreditsValue(const JPTField *value, NSDictionary *previous) {
-    if (!previous.count) return nil;
+// `artistNames` maps artist URIs to delivered IdentityTrait names; `combine` shows them as new｜old.
+static NSData *JPTNativeCreditsValue(const JPTField *value, NSDictionary *previous, NSDictionary *artistNames, BOOL combine) {
+    if (!previous.count && !artistNames.count) return nil;
     NSMutableSet *existing = [NSMutableSet set];
+    NSMutableData *out = [NSMutableData dataWithCapacity:value->len + 256];
+    BOOL changed = NO;
     JPTReader r = JPTReaderMake(value->data, value->len); JPTField f; BOOL ok;
     while (JPTNext(&r, &f, &ok)) {
-        if (f.field != 1) continue;
+        if (f.field != 1) { JPTWriteRaw(out, &f); continue; }
         if (f.wire != 2) return nil;
-        NSString *name = nil, *group = nil, *role = nil;
+        NSString *name = nil, *group = nil, *role = nil, *uri = nil;
         BOOL navigable = NO;
         NSUInteger names = 0, groups = 0, roles = 0;
         JPTReader cr = JPTReaderMake(f.data, f.len); JPTField cf; BOOL cok;
@@ -58,7 +61,10 @@ static NSData *JPTNativeCreditsValue(const JPTField *value, NSDictionary *previo
                 if (cf.wire != 2 || ++names > 1 || !(name = JPTString(&cf))) return nil;
             } else if (cf.field == 2) {
                 if (cf.wire != 2 || ++roles > 1 || !(role = JPTString(&cf))) return nil;
-            } else if (cf.field == 3 || cf.field == 5) navigable = YES;
+            } else if (cf.field == 3 || cf.field == 5) {
+                navigable = YES;
+                if (cf.field == 3 && cf.wire == 2) uri = JPTString(&cf);
+            }
             else if (cf.field == 6) {
                 if (cf.wire != 2 || ++groups > 1) return nil;
                 JPTReader gr = JPTReaderMake(cf.data, cf.len); JPTField gf; BOOL gok;
@@ -71,10 +77,14 @@ static NSData *JPTNativeCreditsValue(const JPTField *value, NSDictionary *previo
         }
         if (!cok) return nil;
         if (!navigable && name && role && [group isEqualToString:@"Original Metadata"]) [existing addObject:@[role, name]];
+        // Only the display name changes; role, URI, links and group stay as Spotify sent them.
+        NSString *renamed = uri ? artistNames[uri] : nil;
+        if (renamed && combine) renamed = [NSString stringWithFormat:@"%@\uFF5C%@", renamed, name];
+        NSData *contributor = name && JPTUpgradesName(name, renamed) ? JPTReplaceString(f.data, f.len, 1, renamed, NULL) : nil;
+        if (contributor) { JPTWriteData(out, 1, contributor); changed = YES; }
+        else JPTWriteRaw(out, &f);
     }
     if (!ok) return nil;
-    NSMutableData *out = [NSMutableData dataWithBytes:value->data length:value->len];
-    BOOL changed = NO;
     NSArray *keys = @[@"title", @"artists", @"album"];
     NSArray *labels = @[@"Title", @"Artist", @"Album"];
     for (NSUInteger i = 0; i < keys.count; i++) {
@@ -91,8 +101,9 @@ static NSData *JPTNativeCreditsValue(const JPTField *value, NSDictionary *previo
     return changed ? out : nil;
 }
 
-static NSData *JPTNativeCreditsResponse(NSData *body) {
+static NSData *JPTNativeCreditsResponse(NSData *body, BOOL combine) {
     if (!body.length) return body;
+    NSDictionary *artistNames = JPTCreditArtistNamesSnapshot();
     NSMutableData *out = [NSMutableData dataWithCapacity:body.length];
     JPTReader r = JPTReaderMake(body.bytes, body.length); JPTField f; BOOL ok;
     BOOL changed = NO;
@@ -116,7 +127,7 @@ static NSData *JPTNativeCreditsResponse(NSData *body) {
             if (af.field == 3 && af.wire == 2 && JPTNativeCreditsEntryValid(&af)) {
                 NSString *uri = nil; uint64_t status = 0; JPTField value = {0};
                 if (JPTParseEntry(&af, &uri, &status, &value) && status == 200 && [uri hasPrefix:@"spotify:track:"]) {
-                    NSData *newValue = JPTNativeCreditsValue(&value, JPTPreviousFields(uri));
+                    NSData *newValue = JPTNativeCreditsValue(&value, JPTPreviousFields(uri), artistNames, combine);
                     if (newValue) rewritten = JPTRewriteEntry(&af, newValue);
                 }
             }

@@ -6,6 +6,8 @@
 static sqlite3 *gJPTStore;
 static NSMutableDictionary *gArtistNames;
 static NSMutableDictionary *gJPTDirtyArtists;
+static NSMutableDictionary *gCreditArtistNames;
+static NSMutableDictionary *gJPTDirtyCreditArtists;
 static NSString *gJPTStorageError;
 
 static NSObject *JPTStorageLock(void) {
@@ -54,6 +56,7 @@ static BOOL JPTStorageOpen(void) {
     sqlite3_busy_timeout(gJPTStore, 3000);
     if (!JPTStorageExec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;"
         "CREATE TABLE IF NOT EXISTS artist_names (uri TEXT PRIMARY KEY, name TEXT NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS credit_artist_names (uri TEXT PRIMARY KEY, name TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS previous_fields (uri TEXT NOT NULL, field TEXT NOT NULL,"
         "old_value TEXT NOT NULL, new_value TEXT NOT NULL, rank INTEGER NOT NULL, PRIMARY KEY(uri,field));")) {
         sqlite3_close(gJPTStore); gJPTStore = NULL; return NO;
@@ -67,12 +70,13 @@ static NSString *JPTStorageString(sqlite3_stmt *stmt, int column) {
     return text ? [NSString stringWithUTF8String:text] : nil;
 }
 
-static NSMutableDictionary *JPTStorageLoad(BOOL previous) {
+// `names` is a "SELECT uri,name" query for an artist-name table; NULL loads previous_fields.
+static NSMutableDictionary *JPTStorageLoadTable(const char *names) {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     if (!JPTStorageOpen()) return result;
     sqlite3_stmt *stmt = NULL;
-    const char *sql = previous ? "SELECT uri,field,old_value,new_value,rank FROM previous_fields"
-                               : "SELECT uri,name FROM artist_names";
+    BOOL previous = !names;
+    const char *sql = previous ? "SELECT uri,field,old_value,new_value,rank FROM previous_fields" : names;
     int rc = sqlite3_prepare_v2(gJPTStore, sql, -1, &stmt, NULL);
     if (rc == SQLITE_OK) while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         NSString *uri = JPTStorageString(stmt, 0);
@@ -98,6 +102,10 @@ static NSMutableDictionary *JPTStorageLoad(BOOL previous) {
     return result;
 }
 
+static NSMutableDictionary *JPTStorageLoad(BOOL previous) {
+    return JPTStorageLoadTable(previous ? NULL : "SELECT uri,name FROM artist_names");
+}
+
 static NSMutableDictionary *JPTArtistNamesSnapshot(void) {
     @synchronized (JPTStorageLock()) {
         if (!gArtistNames) gArtistNames = JPTStorageLoad(NO);
@@ -115,6 +123,29 @@ static void JPTMergeArtistNames(NSDictionary *names) {
             if (![gArtistNames[uri] isEqual:name]) {
                 gArtistNames[uri] = name;
                 gJPTDirtyArtists[uri] = name;
+            }
+        }
+    }
+}
+
+// Names Spotify displays in IdentityTrait, reused for same-URI Credits contributors.
+static NSDictionary *JPTCreditArtistNamesSnapshot(void) {
+    @synchronized (JPTStorageLock()) {
+        if (!gCreditArtistNames) gCreditArtistNames = JPTStorageLoadTable("SELECT uri,name FROM credit_artist_names");
+        return [gCreditArtistNames copy];
+    }
+}
+
+static void JPTMergeCreditArtistNames(NSDictionary *names) {
+    @synchronized (JPTStorageLock()) {
+        if (!gCreditArtistNames) gCreditArtistNames = JPTStorageLoadTable("SELECT uri,name FROM credit_artist_names");
+        if (!gJPTDirtyCreditArtists) gJPTDirtyCreditArtists = [NSMutableDictionary dictionary];
+        for (NSString *uri in names) {
+            NSString *name = names[uri];
+            if (![uri hasPrefix:@"spotify:artist:"] || ![name isKindOfClass:NSString.class] || !name.length) continue;
+            if (![gCreditArtistNames[uri] isEqual:name]) {
+                gCreditArtistNames[uri] = name;
+                gJPTDirtyCreditArtists[uri] = name;
             }
         }
     }
@@ -139,11 +170,14 @@ static BOOL JPTStorageRow(const char *sql, NSArray *values) {
 
 // Called under the shared lock; only changed fields enter this transaction.
 static BOOL JPTStorageCommit(NSArray *previousChanges) {
-    if (!gJPTDirtyArtists.count && !previousChanges.count) return YES;
+    if (!gJPTDirtyArtists.count && !gJPTDirtyCreditArtists.count && !previousChanges.count) return YES;
     if (!JPTStorageOpen() || !JPTStorageExec("BEGIN IMMEDIATE")) return NO;
     BOOL ok = YES;
     for (NSString *uri in gJPTDirtyArtists) {
         if (!(ok = JPTStorageRow("INSERT OR REPLACE INTO artist_names(uri,name) VALUES(?,?)", @[uri, gJPTDirtyArtists[uri]]))) break;
+    }
+    if (ok) for (NSString *uri in gJPTDirtyCreditArtists) {
+        if (!(ok = JPTStorageRow("INSERT OR REPLACE INTO credit_artist_names(uri,name) VALUES(?,?)", @[uri, gJPTDirtyCreditArtists[uri]]))) break;
     }
     if (ok) for (NSDictionary *change in previousChanges) {
         NSDictionary *pair = change[@"pair"];
@@ -154,7 +188,7 @@ static BOOL JPTStorageCommit(NSArray *previousChanges) {
     }
     if (ok) ok = JPTStorageExec("COMMIT");
     if (!ok) { sqlite3_exec(gJPTStore, "ROLLBACK", NULL, NULL, NULL); return NO; }
-    [gJPTDirtyArtists removeAllObjects];
+    [gJPTDirtyArtists removeAllObjects]; [gJPTDirtyCreditArtists removeAllObjects];
     gJPTStorageError = nil;
     return YES;
 }
@@ -162,10 +196,11 @@ static BOOL JPTStorageCommit(NSArray *previousChanges) {
 static BOOL JPTStorageClear(void) {
     @synchronized (JPTStorageLock()) {
         if (!JPTStorageOpen() || !JPTStorageExec("BEGIN IMMEDIATE")) return NO;
-        if (!JPTStorageExec("DELETE FROM artist_names; DELETE FROM previous_fields; COMMIT;")) {
+        if (!JPTStorageExec("DELETE FROM artist_names; DELETE FROM credit_artist_names; DELETE FROM previous_fields; COMMIT;")) {
             sqlite3_exec(gJPTStore, "ROLLBACK", NULL, NULL, NULL); return NO;
         }
         [gArtistNames removeAllObjects]; [gJPTDirtyArtists removeAllObjects];
+        [gCreditArtistNames removeAllObjects]; [gJPTDirtyCreditArtists removeAllObjects];
         return YES;
     }
 }
@@ -174,14 +209,17 @@ static NSString *JPTStorageSummary(void) {
     @synchronized (JPTStorageLock()) {
         if (!JPTStorageOpen()) return gJPTStorageError ?: @"Database unavailable";
         sqlite3_stmt *stmt = NULL;
-        sqlite3_int64 artists = 0, fields = 0, tracks = 0;
-        int rc = sqlite3_prepare_v2(gJPTStore, "SELECT (SELECT count(*) FROM artist_names),count(*),count(DISTINCT uri) FROM previous_fields", -1, &stmt, NULL);
+        sqlite3_int64 artists = 0, credits = 0, fields = 0, tracks = 0;
+        int rc = sqlite3_prepare_v2(gJPTStore, "SELECT (SELECT count(*) FROM artist_names),(SELECT count(*) FROM credit_artist_names),"
+            "count(*),count(DISTINCT uri) FROM previous_fields", -1, &stmt, NULL);
         if (rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
-            artists = sqlite3_column_int64(stmt, 0); fields = sqlite3_column_int64(stmt, 1); tracks = sqlite3_column_int64(stmt, 2);
+            artists = sqlite3_column_int64(stmt, 0); credits = sqlite3_column_int64(stmt, 1);
+            fields = sqlite3_column_int64(stmt, 2); tracks = sqlite3_column_int64(stmt, 3);
         }
         sqlite3_finalize(stmt);
         unsigned long long bytes = [[NSFileManager.defaultManager attributesOfItemAtPath:JPTStoragePath() error:nil][NSFileSize] unsignedLongLongValue];
-        return [NSString stringWithFormat:@"SQLite · %lld artist names · %lld previous fields / %lld tracks · %@%@", artists, fields, tracks,
+        return [NSString stringWithFormat:@"SQLite · %lld artist names · %lld credit artists · %lld previous fields / %lld tracks · %@%@",
+            artists, credits, fields, tracks,
             [NSByteCountFormatter stringFromByteCount:(long long)bytes countStyle:NSByteCountFormatterCountStyleFile],
             gJPTStorageError ? [@" · " stringByAppendingString:gJPTStorageError] : @""];
     }
