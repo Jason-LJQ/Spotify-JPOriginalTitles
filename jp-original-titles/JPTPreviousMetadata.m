@@ -202,57 +202,8 @@ static BOOL JPTPreviousCompare(NSDictionary *before, NSDictionary *after) {
     }
 }
 
-// IdentityTrait artist [name, uri] lists keyed by track URI, in response order.
-static NSDictionary *JPTIdentityArtists(NSData *body) {
-    if (!body.length) return nil;
-    NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    JPTReader r = JPTReaderMake(body.bytes, body.length); JPTField f; BOOL ok;
-    while (JPTNext(&r, &f, &ok)) {
-        if (f.field != 2 || f.wire != 2 || JPTArrayKind(&f) != kKindIdentityTrait) continue;
-        JPTReader ar = JPTReaderMake(f.data, f.len); JPTField af; BOOL aok;
-        while (JPTNext(&ar, &af, &aok)) {
-            if (af.field != 3 || af.wire != 2) continue;
-            NSString *uri = nil; uint64_t status = 0; JPTField value = {0};
-            if (!JPTParseEntry(&af, &uri, &status, &value) || status != 200 || ![uri hasPrefix:@"spotify:track:"]) continue;
-            NSMutableArray *artists = [NSMutableArray array];
-            JPTReader vr = JPTReaderMake(value.data, value.len); JPTField vf; BOOL vok;
-            while (JPTNext(&vr, &vf, &vok)) {
-                if (vf.field != 5 || vf.wire != 2) continue;
-                [artists addObject:@[JPTSubString(&vf, 1) ?: @"", JPTSubString(&vf, 2) ?: @""]];
-            }
-            // Keep a placeholder so a bad duplicate cannot shift positional matching.
-            if (!result[uri]) result[uri] = [NSMutableArray array];
-            [result[uri] addObject:vok ? artists : @[]];
-        }
-        if (!aok) return nil;
-    }
-    return ok ? result : nil;
-}
-
-// Same-position, same-URI artists whose delivered IdentityTrait name gained CJK text.
-static NSDictionary *JPTCreditArtistChanges(NSData *before, NSData *after) {
-    NSDictionary *old = JPTIdentityArtists(before), *now = JPTIdentityArtists(after);
-    NSMutableDictionary *names = [NSMutableDictionary dictionary];
-    for (NSString *uri in now) {
-        NSArray *oldEntries = old[uri], *newEntries = now[uri];
-        if (oldEntries.count != newEntries.count) continue;
-        for (NSUInteger i = 0; i < newEntries.count; i++) {
-            NSArray *oldArtists = oldEntries[i], *newArtists = newEntries[i];
-            if (oldArtists.count != newArtists.count) continue;
-            for (NSUInteger j = 0; j < newArtists.count; j++) {
-                NSString *artist = newArtists[j][1];
-                if ([artist hasPrefix:@"spotify:artist:"] && [artist isEqualToString:oldArtists[j][1]]
-                    && JPTUpgradesName(oldArtists[j][0], newArtists[j][0])) names[artist] = newArtists[j][0];
-            }
-        }
-    }
-    return names;
-}
-
 static BOOL JPTCapturePreviousResponse(NSData *before, NSData *after) {
     if (!after) return YES;
-    // Staged here and committed by the same transaction as previous fields.
-    JPTMergeCreditArtistNames(JPTCreditArtistChanges(before, after));
     return JPTPreviousCompare(JPTPreviousResponseCarriers(before), JPTPreviousResponseCarriers(after));
 }
 

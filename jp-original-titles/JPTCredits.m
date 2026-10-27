@@ -42,7 +42,7 @@ static BOOL JPTNativeCreditsEntryValid(const JPTField *entry) {
     return ok && headers == 1 && uris == 1 && anys == 1 && values == 1;
 }
 
-// `artistNames` maps artist URIs to delivered IdentityTrait names; `combine` shows them as new｜old.
+// `artistNames` is the plugin's artist URI -> name table; `combine` shows renamed contributors as new｜old.
 static NSData *JPTNativeCreditsValue(const JPTField *value, NSDictionary *previous, NSDictionary *artistNames, BOOL combine) {
     if (!previous.count && !artistNames.count) return nil;
     NSMutableSet *existing = [NSMutableSet set];
@@ -103,7 +103,7 @@ static NSData *JPTNativeCreditsValue(const JPTField *value, NSDictionary *previo
 
 static NSData *JPTNativeCreditsResponse(NSData *body, BOOL combine) {
     if (!body.length) return body;
-    NSDictionary *artistNames = JPTCreditArtistNamesSnapshot();
+    NSDictionary *artistNames = JPTArtistNamesSnapshot();
     NSMutableData *out = [NSMutableData dataWithCapacity:body.length];
     JPTReader r = JPTReaderMake(body.bytes, body.length); JPTField f; BOOL ok;
     BOOL changed = NO;
