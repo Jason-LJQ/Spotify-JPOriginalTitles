@@ -1,6 +1,6 @@
 # spotify-JPOriginalTitles
 
-An iOS plugin that restores original track, album and artist names in Spotify 9.1.88.
+An iOS plugin that restores original track, album and artist names in Spotify. See [Compatibility](#compatibility) for tested versions.
 
 This repository contains prebuilt dylibs and installation instructions.
 
@@ -37,9 +37,20 @@ The plugin rewrites metadata in Spotify's networking layer without changing the 
 
 Completed lookups without an unambiguous original name keep the available client value. The plugin does not guess replacements by title, change the app language or unlock region-restricted content. Korean and song-title multilingual fallback are not enabled.
 
+## Compatibility
+
+The current release (v7.2) has been tested with:
+
+| Spotify for iOS | EeveeSpotify | iOS |
+| --- | --- | --- |
+| 9.2.0 | 7.5.0 | 27.0.1 |
+| 9.1.88 | 7.0.0 | 18.6.2 |
+
+Other Spotify, EeveeSpotify and iOS versions have not been tested but may also work. The plugin checks the classes it hooks at launch and stays inactive if they are missing; the management page shows the hook status.
+
 ## Installation
 
-Requires Spotify iOS 9.1.88 with a plugin loader that loads `Frameworks/*.dylib`.
+Requires Spotify for iOS (see [Compatibility](#compatibility)) with a plugin loader that loads `Frameworks/*.dylib`.
 
 1. Download the latest release.
 2. Put `JPOriginalTitles.dylib` into `Payload/Spotify.app/Frameworks/` with mode 755, then repackage and install. Keep only one version of the plugin.
